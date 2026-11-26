@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/billing-domain"]
+members = ["crates/billing-domain", "crates/billing-memory"]
 
 [workspace.package]
 version = "0.1.0"

@@ -320,11 +320,7 @@ mod tests {
     fn must<T, E: core::fmt::Debug>(result: Result<T, E>) -> T {
         match result {
             Ok(value) => value,
-            Err(error) => {
-                let rendered = format!("{error:?}");
-                assert!(rendered.is_empty(), "{rendered}");
-                std::process::abort();
-            }
+            Err(error) => panic!("{error:?}"),
         }
     }
     use billing::errors::{BillingRejection, WalletError};
