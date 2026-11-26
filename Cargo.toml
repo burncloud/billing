@@ -1,18 +1,6 @@
-[package]
-name = "burncloud-template"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.100.0"
-license = "MIT OR Apache-2.0"
-publish = false
-description = "BurnCloud 计费仓库。纯逻辑在 billing-domain。"
-
-[lints.rust]
-unsafe_code = "forbid"
-
 [workspace]
 resolver = "2"
-members = ["crates/billing-domain"]
+members = ["crates/billing-domain", "crates/burncloud-template"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,3 +8,6 @@ edition = "2021"
 rust-version = "1.100.0"
 license = "MIT OR Apache-2.0"
 publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
