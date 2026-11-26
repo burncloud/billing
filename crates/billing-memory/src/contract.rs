@@ -83,6 +83,10 @@ fn missing_row_is_not_created<S: WalletContract, D: DriveWallet>(store: &S, driv
     ));
     assert_eq!(store.entries().len(), before.len());
     assert_books(store);
+    assert!(matches!(
+        drive.run(Wallet::balance(store, &account, Currency::Usd)),
+        Err(WalletError::Storage(StorageFault::MissingBalance))
+    ));
 }
 
 fn hold_settle_and_release_keep_the_books<S: WalletContract, D: DriveWallet>(store: &S, drive: &D) {
