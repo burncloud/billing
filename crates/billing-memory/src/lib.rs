@@ -3,5 +3,5 @@
 mod contract;
 mod wallet;
 
-pub use contract::{run_wallet_contract, WalletContract};
-pub use wallet::MemoryWallet;
+pub use contract::{run_wallet_contract, DriveWallet, PollReady, WalletContract};
+pub use wallet::{ManualClock, MemoryWallet};
