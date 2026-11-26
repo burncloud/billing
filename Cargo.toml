@@ -5,7 +5,18 @@ edition = "2021"
 rust-version = "1.100.0"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "BurnCloud crate 仓库模板中的最小库。"
+description = "BurnCloud 计费仓库。纯逻辑在 billing-domain。"
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[workspace]
+resolver = "2"
+members = ["crates/billing-domain"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.100.0"
+license = "MIT OR Apache-2.0"
+publish = false
