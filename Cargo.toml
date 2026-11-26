@@ -1,18 +1,22 @@
 [package]
-name = "billing-domain"
+name = "burncloud-template"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.100.0"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "BurnCloud 计费纯逻辑。"
-
-[lib]
-path = "crates/billing-domain/src/lib.rs"
-
-[dependencies]
-billing = { git = "https://github.com/burncloud/next", rev = "bacb93048611f99b9b8a25ed2a04e3d54694cf04" }
-kernel = { git = "https://github.com/burncloud/next", rev = "bacb93048611f99b9b8a25ed2a04e3d54694cf04" }
+description = "BurnCloud 计费仓库。纯逻辑在 billing-domain。"
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[workspace]
+resolver = "2"
+members = ["crates/billing-domain"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.100.0"
+license = "MIT OR Apache-2.0"
+publish = false

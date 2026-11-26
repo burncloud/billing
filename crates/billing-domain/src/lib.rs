@@ -13,7 +13,7 @@ pub use posting::{
 mod manifest {
     #[test]
     fn dependencies_stay_on_the_next_contracts() {
-        let manifest = include_str!("../../../Cargo.toml");
+        let manifest = include_str!("../Cargo.toml");
         let bans = include_str!("../bans.toml");
         let mut names = Vec::new();
         let mut in_dependencies = false;
