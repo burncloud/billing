@@ -3,5 +3,22 @@
 version = 4
 
 [[package]]
-name = "burncloud-template"
+name = "billing"
 version = "0.1.0"
+source = "git+https://github.com/burncloud/next?rev=bacb93048611f99b9b8a25ed2a04e3d54694cf04#bacb93048611f99b9b8a25ed2a04e3d54694cf04"
+dependencies = [
+ "kernel",
+]
+
+[[package]]
+name = "billing-domain"
+version = "0.1.0"
+dependencies = [
+ "billing",
+ "kernel",
+]
+
+[[package]]
+name = "kernel"
+version = "0.1.0"
+source = "git+https://github.com/burncloud/next?rev=bacb93048611f99b9b8a25ed2a04e3d54694cf04#bacb93048611f99b9b8a25ed2a04e3d54694cf04"
