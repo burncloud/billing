@@ -39,10 +39,6 @@ impl ManualClock {
             now: AtomicU64::new(now.0),
         }
     }
-
-    pub fn set(&self, now: UnixMillis) {
-        self.now.store(now.0, Ordering::Relaxed);
-    }
 }
 
 impl Clock for ManualClock {
@@ -88,7 +84,7 @@ impl Default for MemoryWallet<ManualClock> {
 
 impl WalletContract for MemoryWallet<ManualClock> {
     fn set_now(&self, now: UnixMillis) {
-        self.clock.set(now);
+        self.clock.now.store(now.0, Ordering::Relaxed);
     }
 
     fn deposit(&self, account: &AccountId, amount: Money) -> Result<(), WalletError<StorageFault>> {
@@ -169,10 +165,7 @@ impl WalletContract for MemoryWallet<ManualClock> {
 }
 
 impl<C: Clock + Sync> MemoryWallet<C> {
-    /// # Errors
-    ///
-    /// 没有余额行时返回 `WalletError::Storage(StorageFault::MissingBalance)`，不创建余额行。
-    pub fn hold_sync(
+    fn hold_sync(
         &self,
         account: &AccountId,
         request: &RequestId,

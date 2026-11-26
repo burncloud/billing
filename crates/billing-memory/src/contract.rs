@@ -50,11 +50,7 @@ impl DriveWallet for PollReady {
         let mut context = Context::from_waker(waker);
         match future.as_mut().poll(&mut context) {
             Poll::Ready(value) => value,
-            Poll::Pending => {
-                let pending = true;
-                assert!(!pending, "future stayed pending");
-                std::process::abort();
-            }
+            Poll::Pending => unreachable!("内存钱包的 future 不会 pending"),
         }
     }
 }
