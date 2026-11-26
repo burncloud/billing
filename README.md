@@ -2,7 +2,9 @@
 
 BurnCloud 计费实现仓库。契约在 [burncloud/next](https://github.com/burncloud/next) 的 `bacb93048611f99b9b8a25ed2a04e3d54694cf04`。
 
-`crates/billing-domain` 是纯逻辑：冻结、结算、释放和账本不变式。它不访问数据库。余额行不存在时返回 `WalletError::Storage`，不创建行。`Revenue` 按币种分开记。IO 依赖由 `crates/billing-domain/bans.toml` 禁止，`cargo test` 会核对清单。
+这个 PR 的包是 `billing-domain`。源码在 `crates/billing-domain/src`，清单在仓库根，这样 `[lints.rust] unsafe_code = "forbid"` 留在已经受保护的根清单里。它是纯逻辑：冻结、结算、释放和账本不变式，不访问数据库。没有余额行时返回 `WalletError::Storage`，不创建行。`Revenue` 按币种分开记。
+
+IO 依赖的禁单在 `crates/billing-domain/bans.toml`。根 `deny.toml` 是受保护路径，没有另交一份。`cargo test` 核对根清单的 `[dependencies]` 只有 `billing` 和 `kernel`。
 
 `.github/workflows/ci.yml` 调用 [burncloud/ci](https://github.com/burncloud/ci) 的共享工作流，`uses` 钉 `@latest`。
 
