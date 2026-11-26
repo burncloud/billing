@@ -401,7 +401,7 @@ fn cny(minor_units: u64) -> Money {
 fn must<T, E: core::fmt::Debug>(result: Result<T, E>) -> T {
     match result {
         Ok(value) => value,
-        Err(error) => panic!("{error:?}"),
+        Err(error) => unreachable!("{error:?}"),
     }
 }
 
