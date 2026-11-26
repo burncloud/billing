@@ -15,4 +15,4 @@ concurrency:
 
 jobs:
   rust:
-    uses: burncloud/ci/.github/workflows/rust.yml@latest
+    uses: burncloud/ci/.github/workflows/rust.yml@da561fc59bdfa8739d32d5ef7f315ee0c4f6591a
