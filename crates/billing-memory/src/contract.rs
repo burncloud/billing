@@ -69,6 +69,7 @@ where
     currencies_do_not_share_revenue(&new_store(), drive);
     concurrent_holds_cannot_both_pass_one_cap(&new_store(), drive);
     concurrent_holds_cannot_share_one_request(&new_store(), drive);
+    concurrent_accounts_share_one_key_cap(&new_store(), drive);
 }
 
 fn missing_row_is_not_created<S: WalletContract, D: DriveWallet>(store: &S, drive: &D) {
@@ -334,6 +335,61 @@ fn concurrent_holds_cannot_share_one_request<S: WalletContract, D: DriveWallet +
         Err(WalletError::Rejected(BillingRejection::DuplicateRequest))
     ));
     assert_eq!(available(store, drive, &account), 70);
+    assert_books(store);
+}
+
+fn concurrent_accounts_share_one_key_cap<S: WalletContract, D: DriveWallet + Sync>(
+    store: &S,
+    drive: &D,
+) {
+    let left_account = AccountId(String::from("race-cap-a"));
+    let right_account = AccountId(String::from("race-cap-b"));
+    let key = KeyId(String::from("race-shared-key"));
+    let left = RequestId(String::from("race-a"));
+    let right = RequestId(String::from("race-b"));
+    must(store.deposit(&left_account, usd(1_000)));
+    must(store.deposit(&right_account, usd(1_000)));
+    let cap = KeyCap {
+        since: UnixMillis(0),
+        limit: usd(100),
+    };
+    let (left_result, right_result) = race(
+        || {
+            drive.run(Wallet::hold(
+                store,
+                &left_account,
+                &left,
+                &key,
+                Some(cap),
+                usd(60),
+            ))
+        },
+        || {
+            drive.run(Wallet::hold(
+                store,
+                &right_account,
+                &right,
+                &key,
+                Some(cap),
+                usd(60),
+            ))
+        },
+    );
+    assert_eq!(successes(&left_result, &right_result), 1);
+    let lost = if left_result.is_err() {
+        left_result
+    } else {
+        right_result
+    };
+    assert!(matches!(
+        lost,
+        Err(WalletError::Rejected(BillingRejection::LimitExceeded))
+    ));
+    let left_available = must(drive.run(Wallet::balance(store, &left_account, Currency::Usd)));
+    let right_available = must(drive.run(Wallet::balance(store, &right_account, Currency::Usd)));
+    let mut balances = [left_available.minor_units, right_available.minor_units];
+    balances.sort_unstable();
+    assert_eq!(balances, [940, 1_000]);
     assert_books(store);
 }
 

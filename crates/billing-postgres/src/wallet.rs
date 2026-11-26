@@ -2,12 +2,14 @@ use billing::errors::{BillingRejection, WalletError};
 use billing::model::{Direction, Entry, KeyCap, LedgerAccount};
 use billing::ports::Wallet;
 use billing_domain::{
-    post_hold, post_release, post_settle, CurrencyFunds, ExistingHold, HoldRequest, OpenHold,
-    ReleaseRequest, SettleRequest, SpendSoFar, StorageFault, WalletSnapshot,
+    post_hold, post_release, post_settle, ExistingHold, HoldRequest, OpenHold, ReleaseRequest,
+    SettleRequest, SpendSoFar, StorageFault, WalletSnapshot,
 };
 use kernel::model::{AccountId, Currency, KeyId, Money, RequestId, UnixMillis};
 use kernel::ports::Clock;
+use sqlx::migrate::{Migration, MigrationType, Migrator};
 use sqlx::Row;
+use sqlx::SqlSafeStr;
 
 use crate::PostgresError;
 
@@ -27,29 +29,19 @@ impl<C> PostgresWallet<C> {
 
     /// # Errors
     ///
-    /// 迁移文件读不到或执行失败时返回 `PostgresError::Migrate`。
+    /// 迁移执行失败时返回 `PostgresError::Migrate`。
     pub async fn migrate(pool: &sqlx::PgPool) -> Result<(), PostgresError> {
-        sqlx::migrate::Migrator::new(std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/migrations"
-        )))
-        .await
-        .map_err(|error| PostgresError::Migrate(Box::new(error)))?
+        Migrator::with_migrations(vec![Migration::new(
+            1,
+            "wallet".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0001_wallet.sql").into_sql_str(),
+            false,
+        )])
         .run(pool)
         .await
         .map_err(|error| PostgresError::Migrate(Box::new(error)))?;
         Ok(())
-    }
-
-    /// # Errors
-    ///
-    /// 建连失败时返回 `PostgresError::Database`。迁移失败时返回 `PostgresError::Migrate`。
-    pub async fn connect(url: &str, clock: C) -> Result<Self, PostgresError> {
-        let pool = sqlx::PgPool::connect(url)
-            .await
-            .map_err(|error| PostgresError::Database(Box::new(error)))?;
-        Self::migrate(&pool).await?;
-        Ok(Self::new(pool, clock))
     }
 }
 
@@ -147,107 +139,13 @@ impl<C: Clock + Sync> Wallet for PostgresWallet<C> {
         currency: Currency,
         since: UnixMillis,
     ) -> Result<Money, WalletError<Self::Error>> {
-        let mut tx = self.pool.begin().await.map_err(storage)?;
-        let spent = spend_in(&mut tx, key, currency, since, false).await?;
-        tx.commit().await.map_err(storage)?;
+        let spent = spend_on(&self.pool, key, currency, since).await?;
         let minor_units = spent
             .settled
             .minor_units
             .checked_add(spent.open.minor_units)
             .ok_or(rejected(BillingRejection::Overflow))?;
         Ok(money(currency, minor_units))
-    }
-}
-
-impl<C: Clock + Sync> PostgresWallet<C> {
-    /// # Errors
-    ///
-    /// 相加溢出，或结果放不进 `BIGINT` 时，返回 `WalletError::Rejected(BillingRejection::Overflow)`。
-    /// 数据库失败时返回 `WalletError::Storage(PostgresError::Database)`。
-    pub async fn deposit(
-        &self,
-        account: &AccountId,
-        amount: Money,
-    ) -> Result<(), WalletError<PostgresError>> {
-        let mut tx = self.pool.begin().await.map_err(storage)?;
-        let result = deposit_in(&mut tx, account, amount).await;
-        finish(tx, result).await
-    }
-
-    /// # Errors
-    ///
-    /// 分录的账户、方向或币种无法识别时返回 `WalletError::Storage(PostgresError::UnknownEntry)` 或 `PostgresError::UnknownCurrency`。
-    /// 金额或时刻无法当作 `u64` 时返回 `WalletError::Storage(PostgresError::AmountOutOfRange)`。
-    /// 数据库失败时返回 `WalletError::Storage(PostgresError::Database)`。
-    pub async fn entries(&self) -> Result<Vec<Entry>, WalletError<PostgresError>> {
-        let rows = sqlx::query(
-            "SELECT request, account_kind, account_id, entry_key, direction, currency, amount, at FROM entries ORDER BY id",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(storage)?;
-        let mut entries = Vec::new();
-        for row in rows {
-            entries.push(entry_from_row(&row)?);
-        }
-        Ok(entries)
-    }
-
-    /// # Errors
-    ///
-    /// 合计溢出时返回 `WalletError::Rejected(BillingRejection::Overflow)`。
-    /// 收入分录的方向无法识别时返回 `WalletError::Storage(PostgresError::UnknownEntry)`。
-    /// 金额无法当作 `u64` 时返回 `WalletError::Storage(PostgresError::AmountOutOfRange)`。
-    /// 数据库失败时返回 `WalletError::Storage(PostgresError::Database)`。
-    pub async fn funds(
-        &self,
-        currency: Currency,
-    ) -> Result<CurrencyFunds, WalletError<PostgresError>> {
-        let balances =
-            sqlx::query("SELECT available, held, deposited FROM balances WHERE currency = $1")
-                .bind(currency_code(currency))
-                .fetch_all(&self.pool)
-                .await
-                .map_err(storage)?;
-        let mut available = 0_u64;
-        let mut held = 0_u64;
-        let mut deposits = 0_u64;
-        for row in balances {
-            available = available
-                .checked_add(minor_from_row(&row, "available")?)
-                .ok_or(rejected(BillingRejection::Overflow))?;
-            held = held
-                .checked_add(minor_from_row(&row, "held")?)
-                .ok_or(rejected(BillingRejection::Overflow))?;
-            deposits = deposits
-                .checked_add(minor_from_row(&row, "deposited")?)
-                .ok_or(rejected(BillingRejection::Overflow))?;
-        }
-        let revenue_rows = sqlx::query(
-            "SELECT direction, amount FROM entries WHERE currency = $1 AND account_kind = 'revenue'",
-        )
-        .bind(currency_code(currency))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(storage)?;
-        let mut revenue = 0_u64;
-        for row in revenue_rows {
-            let amount = minor_from_row(&row, "amount")?;
-            let direction: String = row.try_get("direction").map_err(storage)?;
-            revenue = match direction.as_str() {
-                "credit" => revenue.checked_add(amount),
-                "debit" => revenue.checked_sub(amount),
-                _ => return Err(WalletError::Storage(PostgresError::UnknownEntry)),
-            }
-            .ok_or(rejected(BillingRejection::Overflow))?;
-        }
-        Ok(CurrencyFunds {
-            currency,
-            available,
-            held,
-            deposits,
-            revenue,
-        })
     }
 }
 
@@ -264,49 +162,6 @@ async fn finish(
     }
 }
 
-async fn deposit_in(
-    tx: &mut Tx<'_>,
-    account: &AccountId,
-    amount: Money,
-) -> Result<(), WalletError<PostgresError>> {
-    sqlx::query(
-        "INSERT INTO balances (account, currency, available, held, deposited) VALUES ($1, $2, 0, 0, 0) ON CONFLICT DO NOTHING",
-    )
-    .bind(account.0.as_str())
-    .bind(currency_code(amount.currency))
-    .execute(&mut **tx)
-    .await
-    .map_err(storage)?;
-    let row = sqlx::query(
-        "SELECT available, deposited FROM balances WHERE account = $1 AND currency = $2 FOR UPDATE",
-    )
-    .bind(account.0.as_str())
-    .bind(currency_code(amount.currency))
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(storage)?;
-    let Some(row) = row else {
-        return Err(WalletError::Storage(PostgresError::MissingBalance));
-    };
-    let available = minor_from_row(&row, "available")?
-        .checked_add(amount.minor_units)
-        .ok_or(rejected(BillingRejection::Overflow))?;
-    let deposited = minor_from_row(&row, "deposited")?
-        .checked_add(amount.minor_units)
-        .ok_or(rejected(BillingRejection::Overflow))?;
-    sqlx::query(
-        "UPDATE balances SET available = $3, deposited = $4 WHERE account = $1 AND currency = $2",
-    )
-    .bind(account.0.as_str())
-    .bind(currency_code(amount.currency))
-    .bind(to_i64(available)?)
-    .bind(to_i64(deposited)?)
-    .execute(&mut **tx)
-    .await
-    .map_err(storage)?;
-    Ok(())
-}
-
 async fn hold_in(
     tx: &mut Tx<'_>,
     now: UnixMillis,
@@ -317,10 +172,10 @@ async fn hold_in(
     amount: Money,
 ) -> Result<(), WalletError<PostgresError>> {
     lock_key(tx, key).await?;
-    let balance = lock_balance(tx, account, amount.currency).await?;
     let existing = lock_hold(tx, account, request).await?;
+    let balance = lock_balance(tx, account, amount.currency).await?;
     let spent = match cap {
-        Some(cap) => spend_in(tx, key, amount.currency, cap.since, true).await?,
+        Some(cap) => spend_in(tx, key, amount.currency, cap.since).await?,
         None => zero_spent(amount.currency),
     };
     let posted = from_domain(post_hold(&HoldRequest {
@@ -406,8 +261,8 @@ async fn release_in(
 }
 
 async fn lock_key(tx: &mut Tx<'_>, key: &KeyId) -> Result<(), WalletError<PostgresError>> {
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(advisory_key(&key.0))
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(key.0.as_str())
         .execute(&mut **tx)
         .await
         .map_err(storage)?;
@@ -475,34 +330,70 @@ async fn spend_in(
     key: &KeyId,
     currency: Currency,
     since: UnixMillis,
-    lock_rows: bool,
 ) -> Result<SpendSoFar, WalletError<PostgresError>> {
-    let settled_rows = sqlx::query(
+    let settled_rows = settled_amounts(&mut **tx, key, currency, since).await?;
+    let open_rows = open_amounts(&mut **tx, key, currency).await?;
+    fold_spend(settled_rows, open_rows, currency)
+}
+
+async fn spend_on(
+    pool: &sqlx::PgPool,
+    key: &KeyId,
+    currency: Currency,
+    since: UnixMillis,
+) -> Result<SpendSoFar, WalletError<PostgresError>> {
+    let settled_rows = settled_amounts(pool, key, currency, since).await?;
+    let open_rows = open_amounts(pool, key, currency).await?;
+    fold_spend(settled_rows, open_rows, currency)
+}
+
+async fn settled_amounts<'e, E>(
+    executor: E,
+    key: &KeyId,
+    currency: Currency,
+    since: UnixMillis,
+) -> Result<Vec<sqlx::postgres::PgRow>, WalletError<PostgresError>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query(
         "SELECT amount FROM entries WHERE entry_key = $1 AND currency = $2 AND direction = 'credit' AND account_kind = 'revenue' AND at >= $3",
     )
     .bind(key.0.as_str())
     .bind(currency_code(currency))
     .bind(to_i64(since.0)?)
-    .fetch_all(&mut **tx)
+    .fetch_all(executor)
     .await
-    .map_err(storage)?;
+    .map_err(storage)
+}
+
+async fn open_amounts<'e, E>(
+    executor: E,
+    key: &KeyId,
+    currency: Currency,
+) -> Result<Vec<sqlx::postgres::PgRow>, WalletError<PostgresError>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query("SELECT amount FROM holds WHERE hold_key = $1 AND currency = $2 AND state = 'open'")
+        .bind(key.0.as_str())
+        .bind(currency_code(currency))
+        .fetch_all(executor)
+        .await
+        .map_err(storage)
+}
+
+fn fold_spend(
+    settled_rows: Vec<sqlx::postgres::PgRow>,
+    open_rows: Vec<sqlx::postgres::PgRow>,
+    currency: Currency,
+) -> Result<SpendSoFar, WalletError<PostgresError>> {
     let mut settled = 0_u64;
     for row in settled_rows {
         settled = settled
             .checked_add(minor_from_row(&row, "amount")?)
             .ok_or(rejected(BillingRejection::Overflow))?;
     }
-    let open_sql = if lock_rows {
-        "SELECT amount FROM holds WHERE hold_key = $1 AND currency = $2 AND state = 'open' FOR UPDATE"
-    } else {
-        "SELECT amount FROM holds WHERE hold_key = $1 AND currency = $2 AND state = 'open'"
-    };
-    let open_rows = sqlx::query(open_sql)
-        .bind(key.0.as_str())
-        .bind(currency_code(currency))
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(storage)?;
     let mut open = 0_u64;
     for row in open_rows {
         open = open
@@ -628,6 +519,7 @@ fn hold_from_row(row: &sqlx::postgres::PgRow) -> Result<ExistingHold, WalletErro
     }
 }
 
+#[cfg(test)]
 fn entry_from_row(row: &sqlx::postgres::PgRow) -> Result<Entry, WalletError<PostgresError>> {
     let kind: String = row.try_get("account_kind").map_err(storage)?;
     let account_id: Option<String> = row.try_get("account_id").map_err(storage)?;
@@ -741,15 +633,6 @@ fn zero_spent(currency: Currency) -> SpendSoFar {
     }
 }
 
-fn advisory_key(key: &str) -> i64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in key.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    i64::from_ne_bytes(hash.to_ne_bytes())
-}
-
 #[cfg(test)]
 mod tests {
     use std::future::Future;
@@ -762,8 +645,12 @@ mod tests {
     use kernel::model::{AccountId, Currency, Money, UnixMillis};
     use kernel::ports::Clock;
     use sqlx::postgres::PgPoolOptions;
+    use sqlx::Row;
 
-    use super::{PostgresError, PostgresWallet};
+    use super::{
+        currency_code, entry_from_row, finish, minor_from_row, rejected, storage, to_i64,
+        PostgresError, PostgresWallet,
+    };
 
     struct TestClock {
         now: AtomicU64,
@@ -785,6 +672,126 @@ mod tests {
         fn now(&self) -> UnixMillis {
             UnixMillis(self.now.load(Ordering::Relaxed))
         }
+    }
+
+    impl<C: Clock + Sync> PostgresWallet<C> {
+        async fn deposit(
+            &self,
+            account: &AccountId,
+            amount: Money,
+        ) -> Result<(), WalletError<PostgresError>> {
+            let mut tx = self.pool.begin().await.map_err(storage)?;
+            let result = deposit_in(&mut tx, account, amount).await;
+            finish(tx, result).await
+        }
+
+        async fn entries(&self) -> Result<Vec<billing::model::Entry>, WalletError<PostgresError>> {
+            let rows = sqlx::query(
+                "SELECT request, account_kind, account_id, entry_key, direction, currency, amount, at FROM entries ORDER BY id",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)?;
+            let mut entries = Vec::new();
+            for row in rows {
+                entries.push(entry_from_row(&row)?);
+            }
+            Ok(entries)
+        }
+
+        async fn funds(
+            &self,
+            currency: Currency,
+        ) -> Result<billing_domain::CurrencyFunds, WalletError<PostgresError>> {
+            let balances =
+                sqlx::query("SELECT available, held, deposited FROM balances WHERE currency = $1")
+                    .bind(currency_code(currency))
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(storage)?;
+            let mut available = 0_u64;
+            let mut held = 0_u64;
+            let mut deposits = 0_u64;
+            for row in balances {
+                available = available
+                    .checked_add(minor_from_row(&row, "available")?)
+                    .ok_or(rejected(BillingRejection::Overflow))?;
+                held = held
+                    .checked_add(minor_from_row(&row, "held")?)
+                    .ok_or(rejected(BillingRejection::Overflow))?;
+                deposits = deposits
+                    .checked_add(minor_from_row(&row, "deposited")?)
+                    .ok_or(rejected(BillingRejection::Overflow))?;
+            }
+            let revenue_rows = sqlx::query(
+                "SELECT direction, amount FROM entries WHERE currency = $1 AND account_kind = 'revenue'",
+            )
+            .bind(currency_code(currency))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)?;
+            let mut revenue = 0_u64;
+            for row in revenue_rows {
+                let amount = minor_from_row(&row, "amount")?;
+                let direction: String = row.try_get("direction").map_err(storage)?;
+                revenue = match direction.as_str() {
+                    "credit" => revenue.checked_add(amount),
+                    "debit" => revenue.checked_sub(amount),
+                    _ => return Err(WalletError::Storage(PostgresError::UnknownEntry)),
+                }
+                .ok_or(rejected(BillingRejection::Overflow))?;
+            }
+            Ok(billing_domain::CurrencyFunds {
+                currency,
+                available,
+                held,
+                deposits,
+                revenue,
+            })
+        }
+    }
+
+    async fn deposit_in(
+        tx: &mut super::Tx<'_>,
+        account: &AccountId,
+        amount: Money,
+    ) -> Result<(), WalletError<PostgresError>> {
+        sqlx::query(
+            "INSERT INTO balances (account, currency, available, held, deposited) VALUES ($1, $2, 0, 0, 0) ON CONFLICT DO NOTHING",
+        )
+        .bind(account.0.as_str())
+        .bind(currency_code(amount.currency))
+        .execute(&mut **tx)
+        .await
+        .map_err(storage)?;
+        let row = sqlx::query(
+            "SELECT available, deposited FROM balances WHERE account = $1 AND currency = $2 FOR UPDATE",
+        )
+        .bind(account.0.as_str())
+        .bind(currency_code(amount.currency))
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(storage)?;
+        let Some(row) = row else {
+            return Err(WalletError::Storage(PostgresError::MissingBalance));
+        };
+        let available = minor_from_row(&row, "available")?
+            .checked_add(amount.minor_units)
+            .ok_or(rejected(BillingRejection::Overflow))?;
+        let deposited = minor_from_row(&row, "deposited")?
+            .checked_add(amount.minor_units)
+            .ok_or(rejected(BillingRejection::Overflow))?;
+        sqlx::query(
+            "UPDATE balances SET available = $3, deposited = $4 WHERE account = $1 AND currency = $2",
+        )
+        .bind(account.0.as_str())
+        .bind(currency_code(amount.currency))
+        .bind(to_i64(available)?)
+        .bind(to_i64(deposited)?)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage)?;
+        Ok(())
     }
 
     struct PgContract {
@@ -921,17 +928,6 @@ mod tests {
         }
     }
 
-    fn sql_ident(name: &str) -> String {
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        {
-            panic!("schema name is not an identifier");
-        }
-        name.to_owned()
-    }
-
     fn next_schema() -> String {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         format!(
@@ -947,17 +943,14 @@ mod tests {
             Ok(pool) => pool,
             Err(error) => panic!("{error}"),
         };
-        if let Err(error) = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "CREATE SCHEMA {}",
-            sql_ident(&schema)
-        )))
-        .execute(&admin)
-        .await
+        if let Err(error) = sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin)
+            .await
         {
             panic!("{error}");
         }
         admin.close().await;
-        let schema_name = sql_ident(&schema);
+        let schema_name = schema.clone();
         let pool = match PgPoolOptions::new()
             .max_connections(8)
             .after_connect(move |conn, _meta| {
