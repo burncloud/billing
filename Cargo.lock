@@ -19,6 +19,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "billing-memory"
+version = "0.1.0"
+dependencies = [
+ "billing",
+ "billing-domain",
+ "kernel",
+]
+
+[[package]]
 name = "kernel"
 version = "0.1.0"
 source = "git+https://github.com/burncloud/next?rev=bacb93048611f99b9b8a25ed2a04e3d54694cf04#bacb93048611f99b9b8a25ed2a04e3d54694cf04"
