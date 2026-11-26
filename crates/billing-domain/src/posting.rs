@@ -33,6 +33,7 @@ pub enum StorageFault {
     HeldBelowOpen,
 }
 
+/// 金额为 0 的分录不写进 `entries`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Posted {
     pub entries: Vec<Entry>,
@@ -73,7 +74,6 @@ pub struct ReleaseRequest<'a> {
 
 /// `existing` 为 `Some` 时，该 `(account, request)` 曾经冻结过，含已结算和已释放。
 /// `cap` 为 `None` 时不检查限额，也不读取 `spent`。`cap.since` 已由调用方折进 `spent`。
-/// 金额为 0 的分录不写。
 ///
 /// # Errors
 ///
@@ -120,7 +120,7 @@ pub fn post_hold(request: &HoldRequest<'_>) -> Result<Posted, WalletError<Storag
     })
 }
 
-/// 调用方先把实际金额封顶到冻结额。超额不改小。金额为 0 的分录不写。
+/// 调用方先把实际金额封顶到冻结额。超额不改小。
 ///
 /// # Errors
 ///
@@ -179,8 +179,6 @@ pub fn post_settle(request: &SettleRequest<'_>) -> Result<Posted, WalletError<St
     })
 }
 
-/// 金额为 0 的分录不写。
-///
 /// # Errors
 ///
 /// 没有冻结时返回 `WalletError::Rejected(BillingRejection::HoldNotFound)`。

@@ -11,5 +11,5 @@ description = "BurnCloud 计费纯逻辑。"
 billing = { git = "https://github.com/burncloud/next", rev = "bacb93048611f99b9b8a25ed2a04e3d54694cf04", version = "=0.1.0" }
 kernel = { git = "https://github.com/burncloud/next", rev = "bacb93048611f99b9b8a25ed2a04e3d54694cf04", version = "=0.1.0" }
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "forbid"
