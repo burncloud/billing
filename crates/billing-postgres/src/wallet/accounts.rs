@@ -1,0 +1,488 @@
+use billing_domain::{
+    post_credit, CreditError, CreditId, CreditPosting, CreditRejection, Credited, FundingRow,
+    Opened, PendingHold,
+};
+use kernel::model::{AccountId, Currency, KeyId, Money, RequestId, UnixMillis};
+use kernel::ports::Clock;
+use sqlx::Row;
+
+use super::{currency_code, is_unique, money, parse_currency, PostgresWallet, Tx};
+use crate::PostgresError;
+
+impl<C: Clock + Sync> PostgresWallet<C> {
+    /// 为 `(account, currency)` 建一行余额为 0 的记录，已存在就不动。
+    ///
+    /// # Errors
+    ///
+    /// 数据库失败时返回 `PostgresError::Database`。
+    pub async fn open_account(
+        &self,
+        account: &AccountId,
+        currency: Currency,
+    ) -> Result<Opened, PostgresError> {
+        let inserted = sqlx::query(
+            "INSERT INTO balances (account, currency, available, held, deposited) VALUES ($1, $2, 0, 0, 0) ON CONFLICT DO NOTHING",
+        )
+        .bind(account.0.as_str())
+        .bind(currency_code(currency))
+        .execute(&self.pool)
+        .await
+        .map_err(database)?;
+        if inserted.rows_affected() == 0 {
+            Ok(Opened::AlreadyOpen)
+        } else {
+            Ok(Opened::Created)
+        }
+    }
+
+    /// 管理员入账。同一账户的同一单号只记一次，余额和入账记录在一个事务里写入。
+    ///
+    /// # Errors
+    ///
+    /// 拒绝原因见 `billing_domain::post_credit`；结果超过 `i64::MAX` 时也返回
+    /// `CreditRejection::Overflow`。数据库失败或读到坏数据时返回 `CreditError::Storage`。
+    pub async fn credit(
+        &self,
+        account: &AccountId,
+        credit: &CreditId,
+        amount: Money,
+    ) -> Result<Credited, CreditError<PostgresError>> {
+        let mut tx = self.pool.begin().await.map_err(credit_storage)?;
+        let credited = credit_in(&mut tx, self.clock.now(), account, credit, amount).await?;
+        tx.commit().await.map_err(credit_storage)?;
+        Ok(credited)
+    }
+
+    /// 按 `created_at`、账户、请求排序。
+    ///
+    /// # Errors
+    ///
+    /// 数据库失败或读到坏数据时返回 `PostgresError`。
+    pub async fn open_holds_created_before(
+        &self,
+        cutoff: UnixMillis,
+    ) -> Result<Vec<PendingHold>, PostgresError> {
+        let rows = sqlx::query(
+            "SELECT account, request, hold_key, currency, amount, created_at FROM holds WHERE state = 'open' AND created_at < $1 ORDER BY created_at, account COLLATE \"C\", request COLLATE \"C\"",
+        )
+        .bind(i64::try_from(cutoff.0).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database)?;
+        let mut pending = Vec::new();
+        for row in rows {
+            let currency: String = row.try_get("currency").map_err(database)?;
+            pending.push(PendingHold {
+                account: AccountId(row.try_get("account").map_err(database)?),
+                request: RequestId(row.try_get("request").map_err(database)?),
+                key: KeyId(row.try_get("hold_key").map_err(database)?),
+                amount: money(parse_currency(&currency)?, unsigned(&row, "amount")?),
+                created_at: UnixMillis(unsigned(&row, "created_at")?),
+            });
+        }
+        Ok(pending)
+    }
+}
+
+async fn credit_in(
+    tx: &mut Tx<'_>,
+    now: UnixMillis,
+    account: &AccountId,
+    credit: &CreditId,
+    amount: Money,
+) -> Result<Credited, CreditError<PostgresError>> {
+    let row = sqlx::query(
+        "SELECT available, deposited FROM balances WHERE account = $1 AND currency = $2 FOR UPDATE",
+    )
+    .bind(account.0.as_str())
+    .bind(currency_code(amount.currency))
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(credit_storage)?;
+    let funding = match row {
+        Some(row) => Some(FundingRow {
+            available: unsigned(&row, "available").map_err(CreditError::Storage)?,
+            deposited: unsigned(&row, "deposited").map_err(CreditError::Storage)?,
+        }),
+        None => None,
+    };
+    let existing =
+        sqlx::query("SELECT currency, amount FROM credits WHERE account = $1 AND credit_id = $2")
+            .bind(account.0.as_str())
+            .bind(credit.0.as_str())
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(credit_storage)?;
+    let existing = match existing {
+        Some(row) => {
+            let currency: String = row.try_get("currency").map_err(credit_storage)?;
+            let currency = parse_currency(&currency).map_err(CreditError::Storage)?;
+            Some(money(
+                currency,
+                unsigned(&row, "amount").map_err(CreditError::Storage)?,
+            ))
+        }
+        None => None,
+    };
+    let funded = match post_credit(credit, amount, funding, existing) {
+        Ok(CreditPosting::AlreadyApplied) => return Ok(Credited::AlreadyApplied),
+        Ok(CreditPosting::Apply(funded)) => funded,
+        Err(reason) => return Err(CreditError::Rejected(reason)),
+    };
+    sqlx::query(
+        "UPDATE balances SET available = $3, deposited = $4 WHERE account = $1 AND currency = $2",
+    )
+    .bind(account.0.as_str())
+    .bind(currency_code(amount.currency))
+    .bind(signed(funded.available)?)
+    .bind(signed(funded.deposited)?)
+    .execute(&mut **tx)
+    .await
+    .map_err(credit_storage)?;
+    let inserted = sqlx::query(
+        "INSERT INTO credits (account, credit_id, currency, amount, at) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(account.0.as_str())
+    .bind(credit.0.as_str())
+    .bind(currency_code(amount.currency))
+    .bind(signed(amount.minor_units)?)
+    .bind(signed(now.0)?)
+    .execute(&mut **tx)
+    .await;
+    match inserted {
+        Ok(_) => Ok(Credited::Applied),
+        Err(error) if is_unique(&error) => {
+            Err(CreditError::Rejected(CreditRejection::ConflictingCredit))
+        }
+        Err(error) => Err(credit_storage(error)),
+    }
+}
+
+fn unsigned(row: &sqlx::postgres::PgRow, name: &str) -> Result<u64, PostgresError> {
+    let value: i64 = row.try_get(name).map_err(database)?;
+    u64::try_from(value).map_err(|_| PostgresError::AmountOutOfRange)
+}
+
+fn signed(value: u64) -> Result<i64, CreditError<PostgresError>> {
+    i64::try_from(value).map_err(|_| CreditError::Rejected(CreditRejection::Overflow))
+}
+
+fn database(error: sqlx::Error) -> PostgresError {
+    PostgresError::Database(Box::new(error))
+}
+
+fn credit_storage(error: sqlx::Error) -> CreditError<PostgresError> {
+    CreditError::Storage(database(error))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use billing_domain::{CreditError, CreditId, CreditRejection, Credited, Opened};
+    use billing_memory::ManualClock;
+    use kernel::model::{AccountId, Currency, Money, UnixMillis};
+    use sqlx::Row;
+
+    use super::super::{migrations, run_migrations};
+    use super::credit_in;
+    use crate::testdb::{database_url, schema_pool};
+    use crate::{PostgresError, PostgresWallet};
+
+    fn runtime() -> tokio::runtime::Runtime {
+        match tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    fn block<T>(runtime: &tokio::runtime::Runtime, future: impl Future<Output = T>) -> T {
+        runtime.block_on(future)
+    }
+
+    fn ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("{error:?}"),
+        }
+    }
+
+    fn usd(minor_units: u64) -> Money {
+        Money {
+            currency: Currency::Usd,
+            minor_units,
+        }
+    }
+
+    async fn wallet(now: u64) -> PostgresWallet<ManualClock> {
+        let pool = schema_pool(&database_url()).await;
+        ok(PostgresWallet::<ManualClock>::migrate(&pool).await);
+        PostgresWallet::new(pool, ManualClock::new(UnixMillis(now)))
+    }
+
+    async fn execute(pool: &sqlx::PgPool, sql: &'static str) -> Result<(), sqlx::Error> {
+        sqlx::query(sql).execute(pool).await.map(|_| ())
+    }
+
+    #[test]
+    fn migration_backfills_created_at_from_the_first_held_entry() {
+        let runtime = runtime();
+        block(&runtime, async {
+            let pool = schema_pool(&database_url()).await;
+            let old: Vec<_> = migrations().into_iter().take(2).collect();
+            ok(run_migrations(&pool, old).await);
+            ok(execute(
+                &pool,
+                "INSERT INTO balances (account, currency, available, held, deposited) VALUES ('a', 'usd', 70, 10, 100), ('b', 'usd', 0, 0, 0)",
+            )
+            .await);
+            ok(execute(
+                &pool,
+                "INSERT INTO holds (account, request, hold_key, currency, amount, state) VALUES ('a', 'r-open', 'k', 'usd', 10, 'open'), ('a', 'r-done', 'k', 'usd', 20, 'settled'), ('b', 'r-zero', 'k', 'usd', 0, 'open'), ('b', 'r-open', 'k', 'usd', 0, 'open')",
+            )
+            .await);
+            ok(execute(
+                &pool,
+                "INSERT INTO entries (request, account_kind, account_id, entry_key, direction, currency, amount, at) VALUES ('r-open', 'available', 'a', 'k', 'debit', 'usd', 10, 500), ('r-open', 'held', 'a', 'k', 'credit', 'usd', 10, 500), ('r-open', 'held', 'a', 'k', 'debit', 'usd', 1, 900), ('r-done', 'held', 'a', 'k', 'credit', 'usd', 20, 300), ('r-done', 'held', 'a', 'k', 'debit', 'usd', 20, 400), ('r-done', 'available', 'a', 'k', 'debit', 'usd', 20, 300)",
+            )
+            .await);
+            ok(run_migrations(&pool, migrations()).await);
+            let rows = ok(sqlx::query(
+                "SELECT account, request, created_at FROM holds ORDER BY account, request",
+            )
+            .fetch_all(&pool)
+            .await);
+            let created: Vec<(String, String, i64)> = rows
+                .iter()
+                .map(|row| {
+                    (
+                        ok(row.try_get("account")),
+                        ok(row.try_get("request")),
+                        ok(row.try_get("created_at")),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                created,
+                [
+                    (String::from("a"), String::from("r-done"), 300),
+                    (String::from("a"), String::from("r-open"), 500),
+                    (String::from("b"), String::from("r-open"), 0),
+                    (String::from("b"), String::from("r-zero"), 0),
+                ]
+            );
+            assert!(execute(
+                &pool,
+                "INSERT INTO holds (account, request, hold_key, currency, amount, state) VALUES ('a', 'r-new', 'k', 'usd', 1, 'open')",
+            )
+            .await
+            .is_err());
+            assert!(execute(
+                &pool,
+                "INSERT INTO holds (account, request, hold_key, currency, amount, state, created_at) VALUES ('a', 'r-new', 'k', 'usd', 1, 'open', -1)",
+            )
+            .await
+            .is_err());
+            let wallet = PostgresWallet::new(pool, ManualClock::new(UnixMillis(0)));
+            let pending = ok(wallet.open_holds_created_before(UnixMillis(u64::MAX)).await);
+            let order: Vec<(&str, &str, u64)> = pending
+                .iter()
+                .map(|hold| {
+                    (
+                        hold.account.0.as_str(),
+                        hold.request.0.as_str(),
+                        hold.created_at.0,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                order,
+                [("b", "r-open", 0), ("b", "r-zero", 0), ("a", "r-open", 500)]
+            );
+        });
+    }
+
+    #[test]
+    fn credits_table_rejects_bad_rows() {
+        let runtime = runtime();
+        block(&runtime, async {
+            let wallet = wallet(0).await;
+            ok(wallet
+                .open_account(&AccountId(String::from("a")), Currency::Usd)
+                .await);
+            for sql in [
+                "INSERT INTO credits (account, credit_id, currency, amount, at) VALUES ('a', '', 'usd', 1, 0)",
+                "INSERT INTO credits (account, credit_id, currency, amount, at) VALUES ('a', 'c', 'usd', 0, 0)",
+                "INSERT INTO credits (account, credit_id, currency, amount, at) VALUES ('a', 'c', 'usd', 1, -1)",
+                "INSERT INTO credits (account, credit_id, currency, amount, at) VALUES ('a', 'c', 'eur', 1, 0)",
+                "INSERT INTO credits (account, credit_id, currency, amount, at) VALUES ('a', 'c', 'cny', 1, 0)",
+                "INSERT INTO credits (account, credit_id, currency, amount, at) VALUES ('z', 'c', 'usd', 1, 0)",
+            ] {
+                assert!(execute(&wallet.pool, sql).await.is_err(), "{sql}");
+            }
+            ok(execute(
+                &wallet.pool,
+                "INSERT INTO credits (account, credit_id, currency, amount, at) VALUES ('a', 'c', 'usd', 1, 0)",
+            )
+            .await);
+        });
+    }
+
+    #[test]
+    fn credit_records_its_time_and_leaves_rows_unchanged_on_overflow() {
+        let runtime = runtime();
+        block(&runtime, async {
+            let wallet = wallet(4_242).await;
+            let account = AccountId(String::from("big"));
+            assert_eq!(
+                ok(wallet.open_account(&account, Currency::Usd).await),
+                Opened::Created
+            );
+            assert!(matches!(
+                wallet
+                    .credit(&account, &CreditId(String::from("c-1")), usd(10))
+                    .await,
+                Ok(Credited::Applied)
+            ));
+            let at: i64 = ok(ok(sqlx::query(
+                "SELECT at FROM credits WHERE account = 'big' AND credit_id = 'c-1'",
+            )
+            .fetch_one(&wallet.pool)
+            .await)
+            .try_get("at"));
+            assert_eq!(at, 4_242);
+            let too_big = u64::try_from(i64::MAX).map_or(u64::MAX, |max| max - 5);
+            assert!(matches!(
+                wallet
+                    .credit(&account, &CreditId(String::from("c-2")), usd(too_big))
+                    .await,
+                Err(CreditError::Rejected(CreditRejection::Overflow))
+            ));
+            let past_i64 = u64::try_from(i64::MAX).map_or(u64::MAX, |max| max + 1);
+            let fresh = AccountId(String::from("fresh"));
+            ok(wallet.open_account(&fresh, Currency::Usd).await);
+            assert!(matches!(
+                wallet
+                    .credit(&fresh, &CreditId(String::from("c-3")), usd(past_i64))
+                    .await,
+                Err(CreditError::Rejected(CreditRejection::Overflow))
+            ));
+            let row = ok(sqlx::query(
+                "SELECT available, deposited FROM balances WHERE account = 'big'",
+            )
+            .fetch_one(&wallet.pool)
+            .await);
+            let available: i64 = ok(row.try_get("available"));
+            let deposited: i64 = ok(row.try_get("deposited"));
+            assert_eq!((available, deposited), (10, 10));
+            let count: i64 = ok(ok(sqlx::query("SELECT COUNT(*) AS n FROM credits")
+                .fetch_one(&wallet.pool)
+                .await)
+            .try_get("n"));
+            assert_eq!(count, 1);
+        });
+    }
+
+    #[test]
+    fn a_failed_credit_insert_rolls_back_the_balance() {
+        let runtime = runtime();
+        block(&runtime, async {
+            let wallet = wallet(0).await;
+            let account = AccountId(String::from("blocked"));
+            ok(wallet.open_account(&account, Currency::Usd).await);
+            ok(execute(
+                &wallet.pool,
+                "ALTER TABLE credits ADD CONSTRAINT credits_reject_blocked CHECK (credit_id <> 'blocked')",
+            )
+            .await);
+            assert!(matches!(
+                wallet
+                    .credit(&account, &CreditId(String::from("blocked")), usd(9))
+                    .await,
+                Err(CreditError::Storage(PostgresError::Database(_)))
+            ));
+            let row = ok(sqlx::query(
+                "SELECT available, deposited FROM balances WHERE account = 'blocked'",
+            )
+            .fetch_one(&wallet.pool)
+            .await);
+            let available: i64 = ok(row.try_get("available"));
+            let deposited: i64 = ok(row.try_get("deposited"));
+            assert_eq!((available, deposited), (0, 0));
+        });
+    }
+
+    #[test]
+    fn a_credit_id_raced_across_currencies_is_applied_once() {
+        let runtime = runtime();
+        let wallet = Arc::new(block(&runtime, wallet(0)));
+        let account = AccountId(String::from("racer"));
+        let credit = CreditId(String::from("c-race"));
+        block(&runtime, async {
+            ok(wallet.open_account(&account, Currency::Usd).await);
+            ok(wallet.open_account(&account, Currency::Cny).await);
+        });
+        let mut first = ok(block(&runtime, wallet.pool.begin()));
+        assert!(matches!(
+            block(
+                &runtime,
+                credit_in(&mut first, UnixMillis(0), &account, &credit, usd(5))
+            ),
+            Ok(Credited::Applied)
+        ));
+        let second = {
+            let wallet = Arc::clone(&wallet);
+            let account = account.clone();
+            let credit = credit.clone();
+            runtime.spawn(async move {
+                wallet
+                    .credit(
+                        &account,
+                        &credit,
+                        Money {
+                            currency: Currency::Cny,
+                            minor_units: 5,
+                        },
+                    )
+                    .await
+            })
+        };
+        let mut waited = 0;
+        while waited < 500 && !block(&runtime, insert_is_blocked(&wallet.pool)) {
+            std::thread::sleep(Duration::from_millis(10));
+            waited += 1;
+        }
+        assert!(waited < 500);
+        ok(block(&runtime, first.commit()));
+        let second: Result<Credited, CreditError<PostgresError>> = ok(block(&runtime, second));
+        assert!(matches!(
+            second,
+            Err(CreditError::Rejected(CreditRejection::ConflictingCredit))
+        ));
+        let deposited: i64 = ok(ok(block(
+            &runtime,
+            sqlx::query("SELECT SUM(deposited)::BIGINT AS total FROM balances")
+                .fetch_one(&wallet.pool),
+        ))
+        .try_get("total"));
+        assert_eq!(deposited, 5);
+    }
+
+    async fn insert_is_blocked(pool: &sqlx::PgPool) -> bool {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'INSERT INTO credits%' AND pid <> pg_backend_pid()",
+        )
+        .fetch_one(pool)
+        .await;
+        match row {
+            Ok(row) => ok(row.try_get::<i64, _>("n")) > 0,
+            Err(error) => panic!("{error}"),
+        }
+    }
+}

@@ -13,6 +13,8 @@ use sqlx::SqlSafeStr;
 
 use crate::PostgresError;
 
+mod accounts;
+
 type Tx<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
 
 /// Postgres 上的钱包。判定调用 `billing-domain`，分录时间用 `clock.now()`。
@@ -33,27 +35,52 @@ impl<C> PostgresWallet<C> {
     ///
     /// 迁移执行失败时返回 `PostgresError::Migrate`。
     pub async fn migrate(pool: &sqlx::PgPool) -> Result<(), PostgresError> {
-        Migrator::with_migrations(vec![
-            Migration::new(
-                1,
-                "wallet".into(),
-                MigrationType::Simple,
-                include_str!("../migrations/0001_wallet.sql").into_sql_str(),
-                false,
-            ),
-            Migration::new(
-                2,
-                "model_prices".into(),
-                MigrationType::Simple,
-                include_str!("../migrations/0002_model_prices.sql").into_sql_str(),
-                false,
-            ),
-        ])
+        run_migrations(pool, migrations()).await
+    }
+}
+
+fn migrations() -> Vec<Migration> {
+    vec![
+        Migration::new(
+            1,
+            "wallet".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0001_wallet.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            2,
+            "model_prices".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0002_model_prices.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            3,
+            "hold_created_at".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0003_hold_created_at.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            4,
+            "credits".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0004_credits.sql").into_sql_str(),
+            false,
+        ),
+    ]
+}
+
+async fn run_migrations(
+    pool: &sqlx::PgPool,
+    migrations: Vec<Migration>,
+) -> Result<(), PostgresError> {
+    Migrator::with_migrations(migrations)
         .run(pool)
         .await
         .map_err(|error| PostgresError::Migrate(Box::new(error)))?;
-        Ok(())
-    }
+    Ok(())
 }
 
 impl<C: Clock + Sync> Wallet for PostgresWallet<C> {
@@ -204,7 +231,7 @@ async fn hold_in(
         spent,
     }))?;
     write_balance(tx, account, posted.balance).await?;
-    insert_open_hold(tx, account, request, key, amount).await?;
+    insert_open_hold(tx, now, account, request, key, amount).await?;
     insert_entries(tx, &posted.entries).await?;
     Ok(())
 }
@@ -433,19 +460,21 @@ async fn write_balance(
 
 async fn insert_open_hold(
     tx: &mut Tx<'_>,
+    now: UnixMillis,
     account: &AccountId,
     request: &RequestId,
     key: &KeyId,
     amount: Money,
 ) -> Result<(), WalletError<PostgresError>> {
     let result = sqlx::query(
-        "INSERT INTO holds (account, request, hold_key, currency, amount, state) VALUES ($1, $2, $3, $4, $5, 'open')",
+        "INSERT INTO holds (account, request, hold_key, currency, amount, state, created_at) VALUES ($1, $2, $3, $4, $5, 'open', $6)",
     )
     .bind(account.0.as_str())
     .bind(request.0.as_str())
     .bind(key.0.as_str())
     .bind(currency_code(amount.currency))
     .bind(to_i64(amount.minor_units)?)
+    .bind(to_i64(now.0)?)
     .execute(&mut **tx)
     .await;
     match result {
@@ -643,7 +672,7 @@ mod tests {
 
     use billing::errors::{BillingRejection, WalletError};
     use billing::ports::Wallet;
-    use billing_domain::StorageFault;
+    use billing_domain::{CreditError, CreditId, Credited, Opened, PendingHold, StorageFault};
     use billing_memory::{run_wallet_contract, DriveWallet, WalletContract};
     use kernel::model::{AccountId, Currency, KeyId, Money, RequestId, UnixMillis};
     use kernel::ports::Clock;
@@ -895,6 +924,40 @@ mod tests {
 
         fn set_now(&self, now: UnixMillis) {
             self.wallet.clock.set(now);
+        }
+
+        fn open_account(
+            &self,
+            account: &AccountId,
+            currency: Currency,
+        ) -> Result<Opened, WalletError<StorageFault>> {
+            adapt(
+                self.call(self.wallet.open_account(account, currency))
+                    .map_err(WalletError::Storage),
+            )
+        }
+
+        fn credit(
+            &self,
+            account: &AccountId,
+            credit: &CreditId,
+            amount: Money,
+        ) -> Result<Credited, CreditError<StorageFault>> {
+            match self.call(self.wallet.credit(account, credit, amount)) {
+                Ok(credited) => Ok(credited),
+                Err(CreditError::Rejected(reason)) => Err(CreditError::Rejected(reason)),
+                Err(CreditError::Storage(error)) => panic!("{error:?}"),
+            }
+        }
+
+        fn open_holds_created_before(
+            &self,
+            cutoff: UnixMillis,
+        ) -> Result<Vec<PendingHold>, WalletError<StorageFault>> {
+            adapt(
+                self.call(self.wallet.open_holds_created_before(cutoff))
+                    .map_err(WalletError::Storage),
+            )
         }
     }
 
