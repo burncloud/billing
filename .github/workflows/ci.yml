@@ -16,3 +16,5 @@ concurrency:
 jobs:
   rust:
     uses: burncloud/ci/.github/workflows/rust.yml@latest
+    with:
+      postgres: true
