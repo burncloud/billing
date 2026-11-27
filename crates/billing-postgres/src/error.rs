@@ -1,4 +1,4 @@
-/// `Wallet::Error`。包住数据库失败、迁移失败，以及读到的坏数据。
+/// `Wallet::Error`，也是 `PostgresPrices::load` 的错误。包住数据库失败、迁移失败，以及读到的坏数据。
 #[derive(Debug, thiserror::Error)]
 pub enum PostgresError {
     #[error("没有余额行")]
@@ -17,4 +17,11 @@ pub enum PostgresError {
     UnknownHold,
     #[error("分录无法识别")]
     UnknownEntry,
+    #[error("价格行不合法：{model}")]
+    InvalidPrice {
+        model: String,
+        reason: billing_domain::PriceRejection,
+    },
+    #[error("价格表里有重复模型")]
+    DuplicateModel,
 }

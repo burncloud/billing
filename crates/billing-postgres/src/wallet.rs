@@ -27,17 +27,28 @@ impl<C> PostgresWallet<C> {
         Self { pool, clock }
     }
 
+    /// 执行本 crate 的全部迁移，包括 `model_prices` 表。
+    ///
     /// # Errors
     ///
     /// 迁移执行失败时返回 `PostgresError::Migrate`。
     pub async fn migrate(pool: &sqlx::PgPool) -> Result<(), PostgresError> {
-        Migrator::with_migrations(vec![Migration::new(
-            1,
-            "wallet".into(),
-            MigrationType::Simple,
-            include_str!("../migrations/0001_wallet.sql").into_sql_str(),
-            false,
-        )])
+        Migrator::with_migrations(vec![
+            Migration::new(
+                1,
+                "wallet".into(),
+                MigrationType::Simple,
+                include_str!("../migrations/0001_wallet.sql").into_sql_str(),
+                false,
+            ),
+            Migration::new(
+                2,
+                "model_prices".into(),
+                MigrationType::Simple,
+                include_str!("../migrations/0002_model_prices.sql").into_sql_str(),
+                false,
+            ),
+        ])
         .run(pool)
         .await
         .map_err(|error| PostgresError::Migrate(Box::new(error)))?;
@@ -603,7 +614,7 @@ fn currency_code(currency: Currency) -> &'static str {
     }
 }
 
-fn parse_currency(value: &str) -> Result<Currency, PostgresError> {
+pub(crate) fn parse_currency(value: &str) -> Result<Currency, PostgresError> {
     match value {
         "usd" => Ok(Currency::Usd),
         "cny" => Ok(Currency::Cny),
@@ -636,8 +647,9 @@ mod tests {
     use billing_memory::{run_wallet_contract, DriveWallet, WalletContract};
     use kernel::model::{AccountId, Currency, KeyId, Money, RequestId, UnixMillis};
     use kernel::ports::Clock;
-    use sqlx::postgres::PgPoolOptions;
     use sqlx::Row;
+
+    use crate::testdb::{database_url, schema_pool};
 
     use super::{
         currency_code, entry_from_row, finish, minor_from_row, rejected, storage, to_i64,
@@ -913,55 +925,8 @@ mod tests {
         }
     }
 
-    fn database_url() -> String {
-        match std::env::var("DATABASE_URL") {
-            Ok(url) if !url.is_empty() => url,
-            _ => panic!("DATABASE_URL is required"),
-        }
-    }
-
-    fn next_schema() -> String {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        format!(
-            "b{}_{:x}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        )
-    }
-
     async fn open_store(url: &str, handle: tokio::runtime::Handle) -> PgContract {
-        let schema = next_schema();
-        let admin = match sqlx::PgPool::connect(url).await {
-            Ok(pool) => pool,
-            Err(error) => panic!("{error}"),
-        };
-        if let Err(error) = sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-            .execute(&admin)
-            .await
-        {
-            panic!("{error}");
-        }
-        admin.close().await;
-        let schema_name = schema.clone();
-        let pool = match PgPoolOptions::new()
-            .max_connections(8)
-            .after_connect(move |conn, _meta| {
-                let schema_name = schema_name.clone();
-                Box::pin(async move {
-                    sqlx::query(sqlx::AssertSqlSafe(format!(
-                        "SET search_path TO {schema_name}"
-                    )))
-                    .execute(&mut *conn)
-                    .await?;
-                    Ok(())
-                })
-            })
-            .connect(url)
-            .await
-        {
-            Ok(pool) => pool,
-            Err(error) => panic!("{error}"),
-        };
+        let pool = schema_pool(url).await;
         if let Err(error) = PostgresWallet::<TestClock>::migrate(&pool).await {
             panic!("{error}");
         }
