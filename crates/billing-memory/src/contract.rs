@@ -20,6 +20,39 @@ pub trait WalletContract: Wallet<Error = StorageFault> + Sync {
 
     fn entries(&self) -> Vec<Entry>;
 
+    /// 为 `(account, currency)` 建一行余额为 0 的记录，已存在就不动。
+    ///
+    /// # Errors
+    ///
+    /// 存储失败时返回 `WalletError::Storage`。
+    fn open_account(
+        &self,
+        account: &AccountId,
+        currency: Currency,
+    ) -> Result<billing_domain::Opened, WalletError<StorageFault>>;
+
+    /// 管理员入账。同一账户的同一单号只记一次。
+    ///
+    /// # Errors
+    ///
+    /// 拒绝原因见 `billing_domain::post_credit`。存储失败时返回 `billing_domain::CreditError::Storage`。
+    fn credit(
+        &self,
+        account: &AccountId,
+        credit: &billing_domain::CreditId,
+        amount: Money,
+    ) -> Result<billing_domain::Credited, billing_domain::CreditError<StorageFault>>;
+
+    /// 按 `created_at`、账户、请求排序。
+    ///
+    /// # Errors
+    ///
+    /// 存储失败时返回 `WalletError::Storage`。
+    fn open_holds_created_before(
+        &self,
+        cutoff: UnixMillis,
+    ) -> Result<Vec<billing_domain::PendingHold>, WalletError<StorageFault>>;
+
     /// # Errors
     ///
     /// 合计溢出时返回 `WalletError::Rejected(BillingRejection::Overflow)`。
@@ -70,6 +103,8 @@ where
     concurrent_holds_cannot_both_pass_one_cap(&new_store(), drive);
     concurrent_holds_cannot_share_one_request(&new_store(), drive);
     concurrent_accounts_share_one_key_cap(&new_store(), drive);
+    accounts_open_and_credits_apply_once(&new_store(), drive);
+    open_holds_carry_their_creation_time(&new_store(), drive);
 }
 
 fn missing_row_is_not_created<S: WalletContract, D: DriveWallet>(store: &S, drive: &D) {
@@ -390,6 +425,139 @@ fn concurrent_accounts_share_one_key_cap<S: WalletContract, D: DriveWallet + Syn
     let mut balances = [left_available.minor_units, right_available.minor_units];
     balances.sort_unstable();
     assert_eq!(balances, [940, 1_000]);
+    assert_books(store);
+}
+
+fn accounts_open_and_credits_apply_once<S: WalletContract, D: DriveWallet>(store: &S, drive: &D) {
+    use billing_domain::{CreditError, CreditId, CreditRejection, Credited, Opened};
+
+    let account = AccountId(String::from("fund"));
+    let request = RequestId(String::from("fund-req"));
+    let key = KeyId(String::from("fund-key"));
+    let first = CreditId(String::from("credit-1"));
+    assert!(matches!(
+        drive.run(Wallet::hold(store, &account, &request, &key, None, usd(1))),
+        Err(WalletError::Storage(StorageFault::MissingBalance))
+    ));
+    assert_eq!(
+        store.credit(&account, &first, usd(100)),
+        Err(CreditError::Rejected(CreditRejection::NotOpened))
+    );
+    assert_eq!(
+        must(store.open_account(&account, Currency::Usd)),
+        Opened::Created
+    );
+    assert_eq!(
+        must(store.open_account(&account, Currency::Usd)),
+        Opened::AlreadyOpen
+    );
+    assert_eq!(available(store, drive, &account), 0);
+    assert!(matches!(
+        drive.run(Wallet::hold(store, &account, &request, &key, None, usd(1))),
+        Err(WalletError::Rejected(BillingRejection::InsufficientBalance))
+    ));
+    assert_eq!(
+        store.credit(&account, &first, usd(100)),
+        Ok(Credited::Applied)
+    );
+    assert_eq!(
+        store.credit(&account, &first, usd(100)),
+        Ok(Credited::AlreadyApplied)
+    );
+    assert_eq!(available(store, drive, &account), 100);
+    assert_eq!(
+        store.credit(&account, &first, usd(50)),
+        Err(CreditError::Rejected(CreditRejection::ConflictingCredit))
+    );
+    assert_eq!(
+        store.credit(&account, &first, cny(100)),
+        Err(CreditError::Rejected(CreditRejection::ConflictingCredit))
+    );
+    assert_eq!(
+        store.credit(&account, &CreditId(String::from("credit-cny")), cny(5)),
+        Err(CreditError::Rejected(CreditRejection::NotOpened))
+    );
+    assert_eq!(
+        store.credit(&account, &CreditId(String::from("credit-0")), usd(0)),
+        Err(CreditError::Rejected(CreditRejection::ZeroAmount))
+    );
+    assert_eq!(
+        store.credit(&account, &CreditId(String::new()), usd(1)),
+        Err(CreditError::Rejected(CreditRejection::EmptyCreditId))
+    );
+    assert_eq!(
+        store.credit(
+            &account,
+            &CreditId(String::from("credit-big")),
+            usd(u64::MAX)
+        ),
+        Err(CreditError::Rejected(CreditRejection::Overflow))
+    );
+    must(drive.run(Wallet::hold(store, &account, &request, &key, None, usd(30))));
+    assert_eq!(
+        store.credit(&account, &CreditId(String::from("credit-2")), usd(5)),
+        Ok(Credited::Applied)
+    );
+    assert_eq!(available(store, drive, &account), 75);
+    assert_eq!(
+        must(drive.run(Wallet::held(store, &account, &request))),
+        usd(30)
+    );
+    assert_eq!(
+        must(store.open_account(&account, Currency::Usd)),
+        Opened::AlreadyOpen
+    );
+    assert_eq!(available(store, drive, &account), 75);
+    let other = AccountId(String::from("fund-other"));
+    assert_eq!(
+        must(store.open_account(&other, Currency::Usd)),
+        Opened::Created
+    );
+    assert_eq!(store.credit(&other, &first, usd(7)), Ok(Credited::Applied));
+    assert_eq!(available(store, drive, &other), 7);
+    let funds = must(store.funds(Currency::Usd));
+    assert_eq!(funds.deposits, 112);
+    assert_eq!(funds.available + funds.held, 112);
+    assert_books(store);
+}
+
+fn open_holds_carry_their_creation_time<S: WalletContract, D: DriveWallet>(store: &S, drive: &D) {
+    use billing_domain::PendingHold;
+
+    let account = AccountId(String::from("aged"));
+    let key = KeyId(String::from("aged-key"));
+    let early = RequestId(String::from("aged-early"));
+    let late = RequestId(String::from("aged-late"));
+    let closed = RequestId(String::from("aged-closed"));
+    must(store.deposit(&account, usd(100)));
+    store.set_now(UnixMillis(100));
+    must(drive.run(Wallet::hold(store, &account, &early, &key, None, usd(10))));
+    must(drive.run(Wallet::hold(store, &account, &closed, &key, None, usd(10))));
+    store.set_now(UnixMillis(200));
+    must(drive.run(Wallet::hold(store, &account, &late, &key, None, usd(10))));
+    must(drive.run(Wallet::release(store, &account, &closed)));
+    let before_late = must(store.open_holds_created_before(UnixMillis(200)));
+    assert_eq!(
+        before_late,
+        vec![PendingHold {
+            account: account.clone(),
+            request: early.clone(),
+            key: key.clone(),
+            amount: usd(10),
+            created_at: UnixMillis(100),
+        }]
+    );
+    let all = must(store.open_holds_created_before(UnixMillis(201)));
+    let requests: Vec<(&str, u64)> = all
+        .iter()
+        .map(|hold| (hold.request.0.as_str(), hold.created_at.0))
+        .collect();
+    assert_eq!(requests, [("aged-early", 100), ("aged-late", 200)]);
+    assert_eq!(must(store.open_holds_created_before(UnixMillis(100))), []);
+    must(drive.run(Wallet::settle(store, &account, &early, usd(10))));
+    let after_settle = must(store.open_holds_created_before(UnixMillis(201)));
+    assert_eq!(after_settle.len(), 1);
+    assert_eq!(after_settle[0].request, late);
     assert_books(store);
 }
 
