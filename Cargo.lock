@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "billing-domain"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "billing",
  "kernel",
@@ -47,7 +47,7 @@ dependencies = [
 
 [[package]]
 name = "billing-memory"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "billing",
  "billing-domain",
@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "billing-postgres"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "billing",
  "billing-domain",
