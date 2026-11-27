@@ -24,24 +24,25 @@ pub trait WalletContract: Wallet<Error = StorageFault> + Sync {
     ///
     /// # Errors
     ///
-    /// 存储失败时返回 `WalletError::Storage`。
+    /// 币种不是 USD 时返回 `FundingRejection::UnsupportedCurrency`。存储失败时返回
+    /// `FundingError::Storage`。
     fn open_account(
         &self,
         account: &AccountId,
         currency: Currency,
-    ) -> Result<billing_domain::Opened, WalletError<StorageFault>>;
+    ) -> Result<billing_domain::Opened, billing_domain::FundingError<StorageFault>>;
 
     /// 管理员入账。同一账户的同一单号只记一次。
     ///
     /// # Errors
     ///
-    /// 拒绝原因见 `billing_domain::post_credit`。存储失败时返回 `billing_domain::CreditError::Storage`。
+    /// 拒绝原因见 `billing_domain::post_credit`。存储失败时返回 `billing_domain::FundingError::Storage`。
     fn credit(
         &self,
         account: &AccountId,
         credit: &billing_domain::CreditId,
         amount: Money,
-    ) -> Result<billing_domain::Credited, billing_domain::CreditError<StorageFault>>;
+    ) -> Result<billing_domain::Credited, billing_domain::FundingError<StorageFault>>;
 
     /// 按 `created_at`、账户、请求排序。
     ///
@@ -104,6 +105,7 @@ where
     concurrent_holds_cannot_share_one_request(&new_store(), drive);
     concurrent_accounts_share_one_key_cap(&new_store(), drive);
     accounts_open_and_credits_apply_once(&new_store(), drive);
+    only_usd_accounts_are_opened_and_funded(&new_store(), drive);
     open_holds_carry_their_creation_time(&new_store(), drive);
 }
 
@@ -429,7 +431,7 @@ fn concurrent_accounts_share_one_key_cap<S: WalletContract, D: DriveWallet + Syn
 }
 
 fn accounts_open_and_credits_apply_once<S: WalletContract, D: DriveWallet>(store: &S, drive: &D) {
-    use billing_domain::{CreditError, CreditId, CreditRejection, Credited, Opened};
+    use billing_domain::{CreditId, Credited, FundingError, FundingRejection, Opened};
 
     let account = AccountId(String::from("fund"));
     let request = RequestId(String::from("fund-req"));
@@ -441,7 +443,7 @@ fn accounts_open_and_credits_apply_once<S: WalletContract, D: DriveWallet>(store
     ));
     assert_eq!(
         store.credit(&account, &first, usd(100)),
-        Err(CreditError::Rejected(CreditRejection::NotOpened))
+        Err(FundingError::Rejected(FundingRejection::NotOpened))
     );
     assert_eq!(
         must(store.open_account(&account, Currency::Usd)),
@@ -467,23 +469,15 @@ fn accounts_open_and_credits_apply_once<S: WalletContract, D: DriveWallet>(store
     assert_eq!(available(store, drive, &account), 100);
     assert_eq!(
         store.credit(&account, &first, usd(50)),
-        Err(CreditError::Rejected(CreditRejection::ConflictingCredit))
-    );
-    assert_eq!(
-        store.credit(&account, &first, cny(100)),
-        Err(CreditError::Rejected(CreditRejection::ConflictingCredit))
-    );
-    assert_eq!(
-        store.credit(&account, &CreditId(String::from("credit-cny")), cny(5)),
-        Err(CreditError::Rejected(CreditRejection::NotOpened))
+        Err(FundingError::Rejected(FundingRejection::ConflictingCredit))
     );
     assert_eq!(
         store.credit(&account, &CreditId(String::from("credit-0")), usd(0)),
-        Err(CreditError::Rejected(CreditRejection::ZeroAmount))
+        Err(FundingError::Rejected(FundingRejection::ZeroAmount))
     );
     assert_eq!(
         store.credit(&account, &CreditId(String::new()), usd(1)),
-        Err(CreditError::Rejected(CreditRejection::EmptyCreditId))
+        Err(FundingError::Rejected(FundingRejection::EmptyCreditId))
     );
     assert_eq!(
         store.credit(
@@ -491,7 +485,7 @@ fn accounts_open_and_credits_apply_once<S: WalletContract, D: DriveWallet>(store
             &CreditId(String::from("credit-big")),
             usd(u64::MAX)
         ),
-        Err(CreditError::Rejected(CreditRejection::Overflow))
+        Err(FundingError::Rejected(FundingRejection::Overflow))
     );
     must(drive.run(Wallet::hold(store, &account, &request, &key, None, usd(30))));
     assert_eq!(
@@ -518,6 +512,44 @@ fn accounts_open_and_credits_apply_once<S: WalletContract, D: DriveWallet>(store
     let funds = must(store.funds(Currency::Usd));
     assert_eq!(funds.deposits, 112);
     assert_eq!(funds.available + funds.held, 112);
+    assert_books(store);
+}
+
+fn only_usd_accounts_are_opened_and_funded<S: WalletContract, D: DriveWallet>(
+    store: &S,
+    drive: &D,
+) {
+    use billing_domain::{CreditId, Credited, FundingError, FundingRejection, Opened};
+
+    let account = AccountId(String::from("usd-only"));
+    let first = CreditId(String::from("credit-1"));
+    let unsupported = FundingRejection::UnsupportedCurrency;
+    assert_eq!(
+        store.open_account(&account, Currency::Cny),
+        Err(FundingError::Rejected(unsupported))
+    );
+    assert!(matches!(
+        drive.run(Wallet::balance(store, &account, Currency::Cny)),
+        Err(WalletError::Storage(StorageFault::MissingBalance))
+    ));
+    assert_eq!(
+        must(store.open_account(&account, Currency::Usd)),
+        Opened::Created
+    );
+    assert_eq!(
+        store.credit(&account, &first, usd(100)),
+        Ok(Credited::Applied)
+    );
+    assert_eq!(
+        store.credit(&account, &first, cny(100)),
+        Err(FundingError::Rejected(unsupported))
+    );
+    assert_eq!(
+        store.credit(&account, &CreditId(String::from("credit-cny")), cny(5)),
+        Err(FundingError::Rejected(unsupported))
+    );
+    assert_eq!(available(store, drive, &account), 100);
+    assert_eq!(must(store.funds(Currency::Cny)).deposits, 0);
     assert_books(store);
 }
 

@@ -7,8 +7,8 @@ mod price_book;
 mod pricing;
 
 pub use funding::{
-    post_credit, CreditError, CreditId, CreditPosting, CreditRejection, Credited, FundingRow,
-    Opened, PendingHold,
+    check_funding_currency, post_credit, CreditId, CreditPosting, Credited, FundingError,
+    FundingRejection, FundingRow, Opened, PendingHold,
 };
 pub use invariant::{check_ledger, request_held_flat, CurrencyFunds, InvariantViolation};
 pub use posting::{

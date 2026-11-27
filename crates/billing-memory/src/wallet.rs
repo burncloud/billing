@@ -7,9 +7,10 @@ use billing::errors::{BillingRejection, WalletError};
 use billing::model::{Direction, Entry, KeyCap, LedgerAccount};
 use billing::ports::Wallet;
 use billing_domain::{
-    post_credit, post_hold, post_release, post_settle, CreditError, CreditId, CreditPosting,
-    Credited, CurrencyFunds, ExistingHold, FundingRow, HoldRequest, OpenHold, Opened, PendingHold,
-    ReleaseRequest, SettleRequest, SpendSoFar, StorageFault, WalletSnapshot,
+    check_funding_currency, post_credit, post_hold, post_release, post_settle, CreditId,
+    CreditPosting, Credited, CurrencyFunds, ExistingHold, FundingError, FundingRow, HoldRequest,
+    OpenHold, Opened, PendingHold, ReleaseRequest, SettleRequest, SpendSoFar, StorageFault,
+    WalletSnapshot,
 };
 use kernel::model::{AccountId, Currency, KeyId, Money, RequestId, UnixMillis};
 use kernel::ports::Clock;
@@ -138,7 +139,8 @@ impl WalletContract for MemoryWallet<ManualClock> {
         &self,
         account: &AccountId,
         currency: Currency,
-    ) -> Result<Opened, WalletError<StorageFault>> {
+    ) -> Result<Opened, FundingError<StorageFault>> {
+        check_funding_currency(currency).map_err(FundingError::Rejected)?;
         let mut state = self.lock();
         let key = (account.clone(), currency);
         if state.balances.contains_key(&key) {
@@ -165,7 +167,7 @@ impl WalletContract for MemoryWallet<ManualClock> {
         account: &AccountId,
         credit: &CreditId,
         amount: Money,
-    ) -> Result<Credited, CreditError<StorageFault>> {
+    ) -> Result<Credited, FundingError<StorageFault>> {
         let mut state = self.lock();
         let balance_key = (account.clone(), amount.currency);
         let credit_key = (account.clone(), credit.clone());
@@ -181,7 +183,7 @@ impl WalletContract for MemoryWallet<ManualClock> {
         let funded = match post_credit(credit, amount, row, existing) {
             Ok(CreditPosting::AlreadyApplied) => return Ok(Credited::AlreadyApplied),
             Ok(CreditPosting::Apply(funded)) => funded,
-            Err(reason) => return Err(CreditError::Rejected(reason)),
+            Err(reason) => return Err(FundingError::Rejected(reason)),
         };
         let held = state
             .balances

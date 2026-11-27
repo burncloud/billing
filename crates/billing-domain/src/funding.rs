@@ -1,4 +1,4 @@
-use kernel::model::{AccountId, KeyId, Money, RequestId, UnixMillis};
+use kernel::model::{AccountId, Currency, KeyId, Money, RequestId, UnixMillis};
 
 /// 管理员入账的单号，在同一个账户内唯一。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -17,7 +17,8 @@ pub enum Credited {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CreditRejection {
+pub enum FundingRejection {
+    UnsupportedCurrency,
     EmptyCreditId,
     ZeroAmount,
     NotOpened,
@@ -26,9 +27,21 @@ pub enum CreditRejection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum CreditError<E> {
-    Rejected(CreditRejection),
+pub enum FundingError<E> {
+    Rejected(FundingRejection),
     Storage(E),
+}
+
+/// 首期只给 USD 开户和入账。
+///
+/// # Errors
+///
+/// 不是 USD 时返回 `FundingRejection::UnsupportedCurrency`。
+pub fn check_funding_currency(currency: Currency) -> Result<(), FundingRejection> {
+    match currency {
+        Currency::Usd => Ok(()),
+        Currency::Cny => Err(FundingRejection::UnsupportedCurrency),
+    }
 }
 
 /// 一个币种的余额行里和入账有关的两列。
@@ -49,37 +62,39 @@ pub enum CreditPosting {
 ///
 /// # Errors
 ///
-/// 单号为空时返回 `CreditRejection::EmptyCreditId`。
-/// 金额为 0 时返回 `CreditRejection::ZeroAmount`。
-/// 单号已记过、但金额或币种不同时返回 `CreditRejection::ConflictingCredit`。
-/// 没有余额行时返回 `CreditRejection::NotOpened`。
-/// 相加溢出时返回 `CreditRejection::Overflow`。
+/// 单号为空时返回 `FundingRejection::EmptyCreditId`。
+/// 金额为 0 时返回 `FundingRejection::ZeroAmount`。
+/// 币种不是 USD 时返回 `FundingRejection::UnsupportedCurrency`。
+/// 单号已记过、但金额不同时返回 `FundingRejection::ConflictingCredit`。
+/// 没有余额行时返回 `FundingRejection::NotOpened`。
+/// 相加溢出时返回 `FundingRejection::Overflow`。
 pub fn post_credit(
     credit: &CreditId,
     amount: Money,
     row: Option<FundingRow>,
     existing: Option<Money>,
-) -> Result<CreditPosting, CreditRejection> {
+) -> Result<CreditPosting, FundingRejection> {
     if credit.0.is_empty() {
-        return Err(CreditRejection::EmptyCreditId);
+        return Err(FundingRejection::EmptyCreditId);
     }
     if amount.minor_units == 0 {
-        return Err(CreditRejection::ZeroAmount);
+        return Err(FundingRejection::ZeroAmount);
     }
+    check_funding_currency(amount.currency)?;
     match existing {
         Some(previous) if previous == amount => return Ok(CreditPosting::AlreadyApplied),
-        Some(_) => return Err(CreditRejection::ConflictingCredit),
+        Some(_) => return Err(FundingRejection::ConflictingCredit),
         None => {}
     }
-    let row = row.ok_or(CreditRejection::NotOpened)?;
+    let row = row.ok_or(FundingRejection::NotOpened)?;
     let available = row
         .available
         .checked_add(amount.minor_units)
-        .ok_or(CreditRejection::Overflow)?;
+        .ok_or(FundingRejection::Overflow)?;
     let deposited = row
         .deposited
         .checked_add(amount.minor_units)
-        .ok_or(CreditRejection::Overflow)?;
+        .ok_or(FundingRejection::Overflow)?;
     Ok(CreditPosting::Apply(FundingRow {
         available,
         deposited,
@@ -100,7 +115,9 @@ pub struct PendingHold {
 mod tests {
     use kernel::model::{Currency, Money};
 
-    use super::{post_credit, CreditId, CreditPosting, CreditRejection, FundingRow};
+    use super::{
+        check_funding_currency, post_credit, CreditId, CreditPosting, FundingRejection, FundingRow,
+    };
 
     fn usd(minor_units: u64) -> Money {
         Money {
@@ -140,18 +157,31 @@ mod tests {
     }
 
     #[test]
-    fn a_reused_id_with_other_money_conflicts() {
+    fn a_reused_id_with_another_amount_conflicts() {
+        assert_eq!(
+            post_credit(&id("c-1"), usd(41), Some(row(50, 65)), Some(usd(40))),
+            Err(FundingRejection::ConflictingCredit)
+        );
+    }
+
+    #[test]
+    fn only_usd_can_be_funded() {
         let cny = Money {
             currency: Currency::Cny,
             minor_units: 40,
         };
+        assert_eq!(check_funding_currency(Currency::Usd), Ok(()));
         assert_eq!(
-            post_credit(&id("c-1"), usd(41), Some(row(50, 65)), Some(usd(40))),
-            Err(CreditRejection::ConflictingCredit)
+            check_funding_currency(Currency::Cny),
+            Err(FundingRejection::UnsupportedCurrency)
         );
         assert_eq!(
-            post_credit(&id("c-1"), cny, Some(row(50, 65)), Some(usd(40))),
-            Err(CreditRejection::ConflictingCredit)
+            post_credit(&id("c-1"), cny, Some(row(50, 65)), None),
+            Err(FundingRejection::UnsupportedCurrency)
+        );
+        assert_eq!(
+            post_credit(&id("c-1"), cny, Some(row(50, 65)), Some(cny)),
+            Err(FundingRejection::UnsupportedCurrency)
         );
     }
 
@@ -159,15 +189,15 @@ mod tests {
     fn invalid_credits_are_rejected_before_touching_the_row() {
         assert_eq!(
             post_credit(&id(""), usd(1), Some(row(0, 0)), None),
-            Err(CreditRejection::EmptyCreditId)
+            Err(FundingRejection::EmptyCreditId)
         );
         assert_eq!(
             post_credit(&id("c-0"), usd(0), Some(row(0, 0)), None),
-            Err(CreditRejection::ZeroAmount)
+            Err(FundingRejection::ZeroAmount)
         );
         assert_eq!(
             post_credit(&id("c-2"), usd(1), None, None),
-            Err(CreditRejection::NotOpened)
+            Err(FundingRejection::NotOpened)
         );
     }
 
@@ -175,11 +205,11 @@ mod tests {
     fn overflow_on_either_column_is_rejected() {
         assert_eq!(
             post_credit(&id("c-3"), usd(2), Some(row(u64::MAX - 1, 0)), None),
-            Err(CreditRejection::Overflow)
+            Err(FundingRejection::Overflow)
         );
         assert_eq!(
             post_credit(&id("c-3"), usd(2), Some(row(0, u64::MAX - 1)), None),
-            Err(CreditRejection::Overflow)
+            Err(FundingRejection::Overflow)
         );
         assert_eq!(
             post_credit(
