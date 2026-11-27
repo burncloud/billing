@@ -205,6 +205,7 @@ mod tests {
             "('negative', 'usd', -1, 1, 1, 0)",
             "('cached-above', 'usd', 1, 2, 1, 0)",
             "('eur', 'eur', 1, 1, 1, 0)",
+            "('cny', 'cny', 1, 1, 1, 0)",
             "('', 'usd', 1, 1, 1, 0)",
             "('negative-time', 'usd', 1, 1, 1, -1)",
         ] {
@@ -217,6 +218,7 @@ mod tests {
     #[test]
     fn cny_row_fails_the_whole_load() {
         let store = Store::open();
+        store.drop_checks();
         assert!(store
             .insert("('ok', 'usd', 1, 1, 1, 0), ('cny-model', 'cny', 1, 1, 1, 0)")
             .is_ok());
