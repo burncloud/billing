@@ -9,7 +9,7 @@ description = "BurnCloud 计费的内存钱包。"
 
 [dependencies]
 billing = { git = "https://github.com/burncloud/next", rev = "25db6be6a328b82514ccece2ae2e081a844a787e", version = "=0.2.0" }
-billing-domain = { path = "../billing-domain", version = "=0.1.0" }
+billing-domain = { path = "../billing-domain", version = "=0.2.0" }
 kernel = { git = "https://github.com/burncloud/next", rev = "25db6be6a328b82514ccece2ae2e081a844a787e", version = "=0.2.0" }
 
 [lints]
