@@ -8,8 +8,8 @@ publish.workspace = true
 description = "BurnCloud 计费纯逻辑。"
 
 [dependencies]
-billing = { git = "https://github.com/burncloud/next", rev = "25db6be6a328b82514ccece2ae2e081a844a787e", version = "=0.2.0" }
-kernel = { git = "https://github.com/burncloud/next", rev = "25db6be6a328b82514ccece2ae2e081a844a787e", version = "=0.2.0" }
+billing = { git = "https://github.com/burncloud/next", rev = "881b3db82b8e4eb5dbbb3abcf6e8ab8562dc94c9", version = "=0.3.0" }
+kernel = { git = "https://github.com/burncloud/next", rev = "881b3db82b8e4eb5dbbb3abcf6e8ab8562dc94c9", version = "=0.3.0" }
 
 [lints]
 workspace = true

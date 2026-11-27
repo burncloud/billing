@@ -31,15 +31,15 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "billing"
-version = "0.2.0"
-source = "git+https://github.com/burncloud/next?rev=25db6be6a328b82514ccece2ae2e081a844a787e#25db6be6a328b82514ccece2ae2e081a844a787e"
+version = "0.3.0"
+source = "git+https://github.com/burncloud/next?rev=881b3db82b8e4eb5dbbb3abcf6e8ab8562dc94c9#881b3db82b8e4eb5dbbb3abcf6e8ab8562dc94c9"
 dependencies = [
  "kernel",
 ]
 
 [[package]]
 name = "billing-domain"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "billing",
  "kernel",
@@ -47,7 +47,7 @@ dependencies = [
 
 [[package]]
 name = "billing-memory"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "billing",
  "billing-domain",
@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "billing-postgres"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "billing",
  "billing-domain",
@@ -560,8 +560,8 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.2.0"
-source = "git+https://github.com/burncloud/next?rev=25db6be6a328b82514ccece2ae2e081a844a787e#25db6be6a328b82514ccece2ae2e081a844a787e"
+version = "0.3.0"
+source = "git+https://github.com/burncloud/next?rev=881b3db82b8e4eb5dbbb3abcf6e8ab8562dc94c9#881b3db82b8e4eb5dbbb3abcf6e8ab8562dc94c9"
 
 [[package]]
 name = "libc"
