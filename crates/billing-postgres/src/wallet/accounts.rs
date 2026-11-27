@@ -1,12 +1,12 @@
 use billing_domain::{
-    post_credit, CreditError, CreditId, CreditPosting, CreditRejection, Credited, FundingRow,
-    Opened, PendingHold,
+    check_funding_currency, post_credit, CreditId, CreditPosting, Credited, FundingError,
+    FundingRejection, FundingRow, Opened, PendingHold,
 };
 use kernel::model::{AccountId, Currency, KeyId, Money, RequestId, UnixMillis};
 use kernel::ports::Clock;
 use sqlx::Row;
 
-use super::{currency_code, is_unique, money, parse_currency, PostgresWallet, Tx};
+use super::{currency_code, money, parse_currency, PostgresWallet, Tx};
 use crate::PostgresError;
 
 impl<C: Clock + Sync> PostgresWallet<C> {
@@ -14,12 +14,14 @@ impl<C: Clock + Sync> PostgresWallet<C> {
     ///
     /// # Errors
     ///
-    /// 数据库失败时返回 `PostgresError::Database`。
+    /// 币种不是 USD 时返回 `FundingRejection::UnsupportedCurrency`。数据库失败时返回
+    /// `FundingError::Storage(PostgresError::Database)`。
     pub async fn open_account(
         &self,
         account: &AccountId,
         currency: Currency,
-    ) -> Result<Opened, PostgresError> {
+    ) -> Result<Opened, FundingError<PostgresError>> {
+        check_funding_currency(currency).map_err(FundingError::Rejected)?;
         let inserted = sqlx::query(
             "INSERT INTO balances (account, currency, available, held, deposited) VALUES ($1, $2, 0, 0, 0) ON CONFLICT DO NOTHING",
         )
@@ -27,7 +29,7 @@ impl<C: Clock + Sync> PostgresWallet<C> {
         .bind(currency_code(currency))
         .execute(&self.pool)
         .await
-        .map_err(database)?;
+        .map_err(credit_storage)?;
         if inserted.rows_affected() == 0 {
             Ok(Opened::AlreadyOpen)
         } else {
@@ -40,13 +42,15 @@ impl<C: Clock + Sync> PostgresWallet<C> {
     /// # Errors
     ///
     /// 拒绝原因见 `billing_domain::post_credit`；结果超过 `i64::MAX` 时也返回
-    /// `CreditRejection::Overflow`。数据库失败或读到坏数据时返回 `CreditError::Storage`。
+    /// `FundingRejection::Overflow`。钱包时钟超过 `i64::MAX` 时返回
+    /// `FundingError::Storage(PostgresError::ClockOutOfRange)`。数据库失败或读到坏数据时返回
+    /// `FundingError::Storage`。
     pub async fn credit(
         &self,
         account: &AccountId,
         credit: &CreditId,
         amount: Money,
-    ) -> Result<Credited, CreditError<PostgresError>> {
+    ) -> Result<Credited, FundingError<PostgresError>> {
         let mut tx = self.pool.begin().await.map_err(credit_storage)?;
         let credited = credit_in(&mut tx, self.clock.now(), account, credit, amount).await?;
         tx.commit().await.map_err(credit_storage)?;
@@ -90,7 +94,7 @@ async fn credit_in(
     account: &AccountId,
     credit: &CreditId,
     amount: Money,
-) -> Result<Credited, CreditError<PostgresError>> {
+) -> Result<Credited, FundingError<PostgresError>> {
     let row = sqlx::query(
         "SELECT available, deposited FROM balances WHERE account = $1 AND currency = $2 FOR UPDATE",
     )
@@ -101,8 +105,8 @@ async fn credit_in(
     .map_err(credit_storage)?;
     let funding = match row {
         Some(row) => Some(FundingRow {
-            available: unsigned(&row, "available").map_err(CreditError::Storage)?,
-            deposited: unsigned(&row, "deposited").map_err(CreditError::Storage)?,
+            available: unsigned(&row, "available").map_err(FundingError::Storage)?,
+            deposited: unsigned(&row, "deposited").map_err(FundingError::Storage)?,
         }),
         None => None,
     };
@@ -116,10 +120,10 @@ async fn credit_in(
     let existing = match existing {
         Some(row) => {
             let currency: String = row.try_get("currency").map_err(credit_storage)?;
-            let currency = parse_currency(&currency).map_err(CreditError::Storage)?;
+            let currency = parse_currency(&currency).map_err(FundingError::Storage)?;
             Some(money(
                 currency,
-                unsigned(&row, "amount").map_err(CreditError::Storage)?,
+                unsigned(&row, "amount").map_err(FundingError::Storage)?,
             ))
         }
         None => None,
@@ -127,7 +131,7 @@ async fn credit_in(
     let funded = match post_credit(credit, amount, funding, existing) {
         Ok(CreditPosting::AlreadyApplied) => return Ok(Credited::AlreadyApplied),
         Ok(CreditPosting::Apply(funded)) => funded,
-        Err(reason) => return Err(CreditError::Rejected(reason)),
+        Err(reason) => return Err(FundingError::Rejected(reason)),
     };
     sqlx::query(
         "UPDATE balances SET available = $3, deposited = $4 WHERE account = $1 AND currency = $2",
@@ -139,23 +143,21 @@ async fn credit_in(
     .execute(&mut **tx)
     .await
     .map_err(credit_storage)?;
-    let inserted = sqlx::query(
+    sqlx::query(
         "INSERT INTO credits (account, credit_id, currency, amount, at) VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(account.0.as_str())
     .bind(credit.0.as_str())
     .bind(currency_code(amount.currency))
     .bind(signed(amount.minor_units)?)
-    .bind(signed(now.0)?)
+    .bind(
+        i64::try_from(now.0)
+            .map_err(|_| FundingError::Storage(PostgresError::ClockOutOfRange))?,
+    )
     .execute(&mut **tx)
-    .await;
-    match inserted {
-        Ok(_) => Ok(Credited::Applied),
-        Err(error) if is_unique(&error) => {
-            Err(CreditError::Rejected(CreditRejection::ConflictingCredit))
-        }
-        Err(error) => Err(credit_storage(error)),
-    }
+    .await
+    .map_err(credit_storage)?;
+    Ok(Credited::Applied)
 }
 
 fn unsigned(row: &sqlx::postgres::PgRow, name: &str) -> Result<u64, PostgresError> {
@@ -163,16 +165,16 @@ fn unsigned(row: &sqlx::postgres::PgRow, name: &str) -> Result<u64, PostgresErro
     u64::try_from(value).map_err(|_| PostgresError::AmountOutOfRange)
 }
 
-fn signed(value: u64) -> Result<i64, CreditError<PostgresError>> {
-    i64::try_from(value).map_err(|_| CreditError::Rejected(CreditRejection::Overflow))
+fn signed(value: u64) -> Result<i64, FundingError<PostgresError>> {
+    i64::try_from(value).map_err(|_| FundingError::Rejected(FundingRejection::Overflow))
 }
 
 fn database(error: sqlx::Error) -> PostgresError {
     PostgresError::Database(Box::new(error))
 }
 
-fn credit_storage(error: sqlx::Error) -> CreditError<PostgresError> {
-    CreditError::Storage(database(error))
+fn credit_storage(error: sqlx::Error) -> FundingError<PostgresError> {
+    FundingError::Storage(database(error))
 }
 
 #[cfg(test)]
@@ -181,9 +183,11 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use billing_domain::{CreditError, CreditId, CreditRejection, Credited, Opened};
+    use billing::errors::{BillingRejection, WalletError};
+    use billing::ports::Wallet;
+    use billing_domain::{CreditId, Credited, FundingError, FundingRejection, Opened};
     use billing_memory::ManualClock;
-    use kernel::model::{AccountId, Currency, Money, UnixMillis};
+    use kernel::model::{AccountId, Currency, KeyId, Money, RequestId, UnixMillis};
     use sqlx::Row;
 
     use super::super::{migrations, run_migrations};
@@ -316,6 +320,11 @@ mod tests {
             ok(wallet
                 .open_account(&AccountId(String::from("a")), Currency::Usd)
                 .await);
+            ok(execute(
+                &wallet.pool,
+                "INSERT INTO balances (account, currency, available, held, deposited) VALUES ('a', 'cny', 0, 0, 0)",
+            )
+            .await);
             for sql in [
                 "INSERT INTO credits (account, credit_id, currency, amount, at) VALUES ('a', '', 'usd', 1, 0)",
                 "INSERT INTO credits (account, credit_id, currency, amount, at) VALUES ('a', 'c', 'usd', 0, 0)",
@@ -362,7 +371,7 @@ mod tests {
                 wallet
                     .credit(&account, &CreditId(String::from("c-2")), usd(too_big))
                     .await,
-                Err(CreditError::Rejected(CreditRejection::Overflow))
+                Err(FundingError::Rejected(FundingRejection::Overflow))
             ));
             let past_i64 = u64::try_from(i64::MAX).map_or(u64::MAX, |max| max + 1);
             let fresh = AccountId(String::from("fresh"));
@@ -371,7 +380,7 @@ mod tests {
                 wallet
                     .credit(&fresh, &CreditId(String::from("c-3")), usd(past_i64))
                     .await,
-                Err(CreditError::Rejected(CreditRejection::Overflow))
+                Err(FundingError::Rejected(FundingRejection::Overflow))
             ));
             let row = ok(sqlx::query(
                 "SELECT available, deposited FROM balances WHERE account = 'big'",
@@ -405,7 +414,7 @@ mod tests {
                 wallet
                     .credit(&account, &CreditId(String::from("blocked")), usd(9))
                     .await,
-                Err(CreditError::Storage(PostgresError::Database(_)))
+                Err(FundingError::Storage(PostgresError::Database(_)))
             ));
             let row = ok(sqlx::query(
                 "SELECT available, deposited FROM balances WHERE account = 'blocked'",
@@ -419,16 +428,20 @@ mod tests {
     }
 
     #[test]
-    fn a_credit_id_raced_across_currencies_is_applied_once() {
+    fn a_repeated_credit_waits_for_the_first_and_is_applied_once() {
         let runtime = runtime();
         let wallet = Arc::new(block(&runtime, wallet(0)));
         let account = AccountId(String::from("racer"));
         let credit = CreditId(String::from("c-race"));
-        block(&runtime, async {
-            ok(wallet.open_account(&account, Currency::Usd).await);
-            ok(wallet.open_account(&account, Currency::Cny).await);
-        });
+        ok(block(
+            &runtime,
+            wallet.open_account(&account, Currency::Usd),
+        ));
         let mut first = ok(block(&runtime, wallet.pool.begin()));
+        let pid: i32 = ok(block(
+            &runtime,
+            sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *first),
+        ));
         assert!(matches!(
             block(
                 &runtime,
@@ -440,31 +453,17 @@ mod tests {
             let wallet = Arc::clone(&wallet);
             let account = account.clone();
             let credit = credit.clone();
-            runtime.spawn(async move {
-                wallet
-                    .credit(
-                        &account,
-                        &credit,
-                        Money {
-                            currency: Currency::Cny,
-                            minor_units: 5,
-                        },
-                    )
-                    .await
-            })
+            runtime.spawn(async move { wallet.credit(&account, &credit, usd(5)).await })
         };
         let mut waited = 0;
-        while waited < 500 && !block(&runtime, insert_is_blocked(&wallet.pool)) {
+        while waited < 500 && !block(&runtime, blocks_someone(&wallet.pool, pid)) {
             std::thread::sleep(Duration::from_millis(10));
             waited += 1;
         }
         assert!(waited < 500);
         ok(block(&runtime, first.commit()));
-        let second: Result<Credited, CreditError<PostgresError>> = ok(block(&runtime, second));
-        assert!(matches!(
-            second,
-            Err(CreditError::Rejected(CreditRejection::ConflictingCredit))
-        ));
+        let second: Result<Credited, FundingError<PostgresError>> = ok(block(&runtime, second));
+        assert!(matches!(second, Ok(Credited::AlreadyApplied)));
         let deposited: i64 = ok(ok(block(
             &runtime,
             sqlx::query("SELECT SUM(deposited)::BIGINT AS total FROM balances")
@@ -474,15 +473,91 @@ mod tests {
         assert_eq!(deposited, 5);
     }
 
-    async fn insert_is_blocked(pool: &sqlx::PgPool) -> bool {
-        let row = sqlx::query(
-            "SELECT COUNT(*) AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'INSERT INTO credits%' AND pid <> pg_backend_pid()",
+    #[test]
+    fn migration_fails_when_a_funded_hold_has_no_held_entry() {
+        let runtime = runtime();
+        block(&runtime, async {
+            let pool = schema_pool(&database_url()).await;
+            let old: Vec<_> = migrations().into_iter().take(2).collect();
+            ok(run_migrations(&pool, old).await);
+            ok(execute(
+                &pool,
+                "INSERT INTO balances (account, currency, available, held, deposited) VALUES ('a', 'usd', 90, 10, 100)",
+            )
+            .await);
+            ok(execute(
+                &pool,
+                "INSERT INTO holds (account, request, hold_key, currency, amount, state) VALUES ('a', 'r-lost', 'k', 'usd', 10, 'open'), ('a', 'r-zero', 'k', 'usd', 0, 'open')",
+            )
+            .await);
+            assert!(matches!(
+                run_migrations(&pool, migrations()).await,
+                Err(PostgresError::Migrate(_))
+            ));
+            let applied: i64 = ok(sqlx::query_scalar(
+                "SELECT MAX(version) FROM _sqlx_migrations WHERE success",
+            )
+            .fetch_one(&pool)
+            .await);
+            assert_eq!(applied, 2);
+            assert!(execute(&pool, "SELECT created_at FROM holds")
+                .await
+                .is_err());
+        });
+    }
+
+    #[test]
+    fn a_clock_past_i64_is_a_storage_error() {
+        let runtime = runtime();
+        block(&runtime, async {
+            let wallet = wallet(0).await;
+            let late =
+                PostgresWallet::new(wallet.pool.clone(), ManualClock::new(UnixMillis(u64::MAX)));
+            let account = AccountId(String::from("late"));
+            let key = KeyId(String::from("late-key"));
+            let held = RequestId(String::from("late-held"));
+            let fresh = RequestId(String::from("late-fresh"));
+            ok(wallet.open_account(&account, Currency::Usd).await);
+            assert!(matches!(
+                late.credit(&account, &CreditId(String::from("c-late")), usd(10))
+                    .await,
+                Err(FundingError::Storage(PostgresError::ClockOutOfRange))
+            ));
+            assert!(matches!(
+                wallet
+                    .credit(&account, &CreditId(String::from("c-now")), usd(10))
+                    .await,
+                Ok(Credited::Applied)
+            ));
+            assert!(matches!(
+                late.hold(&account, &fresh, &key, None, usd(3)).await,
+                Err(WalletError::Storage(PostgresError::ClockOutOfRange))
+            ));
+            ok(wallet.hold(&account, &held, &key, None, usd(4)).await);
+            assert!(matches!(
+                late.release(&account, &held).await,
+                Err(WalletError::Storage(PostgresError::ClockOutOfRange))
+            ));
+            assert_eq!(ok(wallet.held(&account, &held).await), usd(4));
+            assert!(matches!(
+                wallet.held(&account, &fresh).await,
+                Err(WalletError::Rejected(BillingRejection::HoldNotFound))
+            ));
+            assert_eq!(ok(wallet.balance(&account, Currency::Usd).await), usd(6));
+            let count: i64 = ok(sqlx::query_scalar("SELECT COUNT(*) FROM credits")
+                .fetch_one(&wallet.pool)
+                .await);
+            assert_eq!(count, 1);
+        });
+    }
+
+    async fn blocks_someone(pool: &sqlx::PgPool, pid: i32) -> bool {
+        let waiting: Result<i64, sqlx::Error> = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
         )
+        .bind(pid)
         .fetch_one(pool)
         .await;
-        match row {
-            Ok(row) => ok(row.try_get::<i64, _>("n")) > 0,
-            Err(error) => panic!("{error}"),
-        }
+        ok(waiting) > 0
     }
 }
