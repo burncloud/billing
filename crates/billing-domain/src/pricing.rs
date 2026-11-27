@@ -6,7 +6,19 @@ pub const TOKENS_PER_PRICE_UNIT: u64 = 1_000_000;
 
 /// 每百万 token 的价格，单位是 `Money::minor_units`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct NanosPerMillionTokens(pub u64);
+pub struct NanosPerMillionTokens(u64);
+
+impl NanosPerMillionTokens {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PriceRejection {
