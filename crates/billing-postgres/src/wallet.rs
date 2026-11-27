@@ -474,7 +474,7 @@ async fn insert_open_hold(
     .bind(key.0.as_str())
     .bind(currency_code(amount.currency))
     .bind(to_i64(amount.minor_units)?)
-    .bind(to_i64(now.0)?)
+    .bind(clock_i64(now)?)
     .execute(&mut **tx)
     .await;
     match result {
@@ -524,7 +524,7 @@ async fn insert_entries(
         .bind(direction)
         .bind(currency_code(entry.amount.currency))
         .bind(to_i64(entry.amount.minor_units)?)
-        .bind(to_i64(entry.at.0)?)
+        .bind(clock_i64(entry.at)?)
         .execute(&mut **tx)
         .await
         .map_err(storage)?;
@@ -621,6 +621,10 @@ fn to_i64(value: u64) -> Result<i64, WalletError<PostgresError>> {
     i64::try_from(value).map_err(|_| rejected(BillingRejection::Overflow))
 }
 
+fn clock_i64(now: UnixMillis) -> Result<i64, WalletError<PostgresError>> {
+    i64::try_from(now.0).map_err(|_| WalletError::Storage(PostgresError::ClockOutOfRange))
+}
+
 fn storage(error: sqlx::Error) -> WalletError<PostgresError> {
     WalletError::Storage(PostgresError::Database(Box::new(error)))
 }
@@ -672,7 +676,7 @@ mod tests {
 
     use billing::errors::{BillingRejection, WalletError};
     use billing::ports::Wallet;
-    use billing_domain::{CreditError, CreditId, Credited, Opened, PendingHold, StorageFault};
+    use billing_domain::{CreditId, Credited, FundingError, Opened, PendingHold, StorageFault};
     use billing_memory::{run_wallet_contract, DriveWallet, WalletContract};
     use kernel::model::{AccountId, Currency, KeyId, Money, RequestId, UnixMillis};
     use kernel::ports::Clock;
@@ -930,11 +934,12 @@ mod tests {
             &self,
             account: &AccountId,
             currency: Currency,
-        ) -> Result<Opened, WalletError<StorageFault>> {
-            adapt(
-                self.call(self.wallet.open_account(account, currency))
-                    .map_err(WalletError::Storage),
-            )
+        ) -> Result<Opened, FundingError<StorageFault>> {
+            match self.call(self.wallet.open_account(account, currency)) {
+                Ok(opened) => Ok(opened),
+                Err(FundingError::Rejected(reason)) => Err(FundingError::Rejected(reason)),
+                Err(FundingError::Storage(error)) => panic!("{error:?}"),
+            }
         }
 
         fn credit(
@@ -942,11 +947,11 @@ mod tests {
             account: &AccountId,
             credit: &CreditId,
             amount: Money,
-        ) -> Result<Credited, CreditError<StorageFault>> {
+        ) -> Result<Credited, FundingError<StorageFault>> {
             match self.call(self.wallet.credit(account, credit, amount)) {
                 Ok(credited) => Ok(credited),
-                Err(CreditError::Rejected(reason)) => Err(CreditError::Rejected(reason)),
-                Err(CreditError::Storage(error)) => panic!("{error:?}"),
+                Err(FundingError::Rejected(reason)) => Err(FundingError::Rejected(reason)),
+                Err(FundingError::Storage(error)) => panic!("{error:?}"),
             }
         }
 

@@ -9,7 +9,7 @@ SET created_at = COALESCE(
             AND entries.account_kind = 'held'
             AND entries.account_id = holds.account
     ),
-    0
+    CASE WHEN holds.amount = 0 THEN 0 END
 );
 
 ALTER TABLE holds ALTER COLUMN created_at SET NOT NULL;
