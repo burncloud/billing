@@ -2,11 +2,15 @@
 
 mod invariant;
 mod posting;
+mod pricing;
 
 pub use invariant::{check_ledger, request_held_flat, CurrencyFunds, InvariantViolation};
 pub use posting::{
     post_hold, post_release, post_settle, ExistingHold, HoldRequest, OpenHold, Posted,
     ReleaseRequest, SettleRequest, SpendSoFar, StorageFault, WalletSnapshot,
+};
+pub use pricing::{
+    ModelPrice, NanosPerMillionTokens, PriceRejection, PricingError, TOKENS_PER_PRICE_UNIT,
 };
 
 #[cfg(test)]
