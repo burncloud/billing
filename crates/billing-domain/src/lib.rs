@@ -1,10 +1,15 @@
 #![forbid(unsafe_code)]
 
+mod funding;
 mod invariant;
 mod posting;
 mod price_book;
 mod pricing;
 
+pub use funding::{
+    post_credit, CreditError, CreditId, CreditPosting, CreditRejection, Credited, FundingRow,
+    Opened, PendingHold,
+};
 pub use invariant::{check_ledger, request_held_flat, CurrencyFunds, InvariantViolation};
 pub use posting::{
     post_hold, post_release, post_settle, ExistingHold, HoldRequest, OpenHold, Posted,
