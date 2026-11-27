@@ -6,9 +6,9 @@ pub enum PostgresError {
     #[error("余额行上的冻结额小于未完成冻结")]
     HeldBelowOpen,
     #[error("数据库错误")]
-    Database(Box<sqlx::Error>),
+    Database(#[source] Box<sqlx::Error>),
     #[error("迁移失败")]
-    Migrate(Box<sqlx::migrate::MigrateError>),
+    Migrate(#[source] Box<sqlx::migrate::MigrateError>),
     #[error("金额超出已校验范围")]
     AmountOutOfRange,
     #[error("币种无法识别")]

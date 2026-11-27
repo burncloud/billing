@@ -139,7 +139,10 @@ impl<C: Clock + Sync> Wallet for PostgresWallet<C> {
         currency: Currency,
         since: UnixMillis,
     ) -> Result<Money, WalletError<Self::Error>> {
-        let spent = spend_on(&self.pool, key, currency, since).await?;
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        lock_key(&mut tx, key).await?;
+        let spent = spend_in(&mut tx, key, currency, since).await?;
+        tx.commit().await.map_err(storage)?;
         let minor_units = spent
             .settled
             .minor_units
@@ -333,17 +336,6 @@ async fn spend_in(
 ) -> Result<SpendSoFar, WalletError<PostgresError>> {
     let settled_rows = settled_amounts(&mut **tx, key, currency, since).await?;
     let open_rows = open_amounts(&mut **tx, key, currency).await?;
-    fold_spend(settled_rows, open_rows, currency)
-}
-
-async fn spend_on(
-    pool: &sqlx::PgPool,
-    key: &KeyId,
-    currency: Currency,
-    since: UnixMillis,
-) -> Result<SpendSoFar, WalletError<PostgresError>> {
-    let settled_rows = settled_amounts(pool, key, currency, since).await?;
-    let open_rows = open_amounts(pool, key, currency).await?;
     fold_spend(settled_rows, open_rows, currency)
 }
 
@@ -642,7 +634,7 @@ mod tests {
     use billing::ports::Wallet;
     use billing_domain::StorageFault;
     use billing_memory::{run_wallet_contract, DriveWallet, WalletContract};
-    use kernel::model::{AccountId, Currency, Money, UnixMillis};
+    use kernel::model::{AccountId, Currency, KeyId, Money, RequestId, UnixMillis};
     use kernel::ports::Clock;
     use sqlx::postgres::PgPoolOptions;
     use sqlx::Row;
@@ -1027,5 +1019,35 @@ mod tests {
             balance,
             Err(WalletError::Storage(PostgresError::MissingBalance))
         ));
+    }
+
+    #[test]
+    fn spent_counts_settled_and_open_inside_one_transaction() {
+        let url = database_url();
+        let drive = TokioDrive::start();
+        let store = drive_open(&url, drive.runtime.handle());
+        let account = AccountId(String::from("spent-tx"));
+        let key = KeyId(String::from("spent-key"));
+        let settled = RequestId(String::from("spent-settled"));
+        let open = RequestId(String::from("spent-open"));
+        let usd = |minor_units| Money {
+            currency: Currency::Usd,
+            minor_units,
+        };
+        assert!(store.call(store.wallet.deposit(&account, usd(200))).is_ok());
+        assert!(store
+            .call(store.wallet.hold(&account, &settled, &key, None, usd(60)))
+            .is_ok());
+        assert!(store
+            .call(store.wallet.settle(&account, &settled, usd(60)))
+            .is_ok());
+        assert!(store
+            .call(store.wallet.hold(&account, &open, &key, None, usd(40)))
+            .is_ok());
+        let spent = match store.call(store.wallet.spent(&key, Currency::Usd, UnixMillis(0))) {
+            Ok(spent) => spent,
+            Err(error) => panic!("{error:?}"),
+        };
+        assert_eq!(spent.minor_units, 100);
     }
 }
