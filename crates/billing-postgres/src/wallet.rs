@@ -1015,4 +1015,166 @@ mod tests {
         };
         assert_eq!(spent.minor_units, 100);
     }
+
+    fn usd(minor_units: u64) -> Money {
+        Money {
+            currency: Currency::Usd,
+            minor_units,
+        }
+    }
+
+    fn exec(store: &PgContract, sql: &str) {
+        let result = store
+            .call(sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_owned())).execute(&store.wallet.pool));
+        if let Err(error) = result {
+            panic!("{error}");
+        }
+    }
+
+    async fn waits_on(pool: &sqlx::PgPool, pid: i32) -> bool {
+        for _ in 0..500 {
+            let waiting: i64 = match sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(pid)
+            .fetch_one(pool)
+            .await
+            {
+                Ok(count) => count,
+                Err(error) => panic!("{error}"),
+            };
+            if waiting > 0 {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    fn blocker(
+        store: &PgContract,
+        lock_sql: &str,
+        bind: &str,
+    ) -> (sqlx::Transaction<'static, sqlx::Postgres>, i32) {
+        let mut tx = match store.call(store.wallet.pool.begin()) {
+            Ok(tx) => tx,
+            Err(error) => panic!("{error}"),
+        };
+        let pid: i32 =
+            match store.call(sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *tx)) {
+                Ok(pid) => pid,
+                Err(error) => panic!("{error}"),
+            };
+        if let Err(error) = store.call(
+            sqlx::query(sqlx::AssertSqlSafe(lock_sql.to_owned()))
+                .bind(bind.to_owned())
+                .execute(&mut *tx),
+        ) {
+            panic!("{error}");
+        }
+        (tx, pid)
+    }
+
+    #[test]
+    fn holds_on_one_key_wait_for_the_key_lock() {
+        let url = database_url();
+        let drive = TokioDrive::start();
+        let store = drive_open(&url, drive.runtime.handle());
+        let account = AccountId(String::from("key-lock"));
+        let request = RequestId(String::from("key-lock-req"));
+        let key = KeyId(format!("key-lock-{}", std::process::id()));
+        assert!(store.call(store.wallet.deposit(&account, usd(100))).is_ok());
+        let (tx, pid) = blocker(
+            &store,
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            key.0.as_str(),
+        );
+        let pool = store.wallet.pool.clone();
+        let watcher = drive.runtime.spawn(async move {
+            let waited = waits_on(&pool, pid).await;
+            if let Err(error) = tx.commit().await {
+                panic!("{error}");
+            }
+            waited
+        });
+        let result = store.call(store.wallet.hold(&account, &request, &key, None, usd(30)));
+        let waited = match store.call(watcher) {
+            Ok(waited) => waited,
+            Err(error) => panic!("{error}"),
+        };
+        assert!(waited, "hold did not wait for the key lock");
+        assert!(result.is_ok());
+        let balance = store.call(store.wallet.balance(&account, Currency::Usd));
+        assert!(matches!(balance, Ok(money) if money == usd(70)));
+    }
+
+    #[test]
+    fn hold_losing_the_insert_race_on_its_request_is_a_duplicate() {
+        let url = database_url();
+        let drive = TokioDrive::start();
+        let store = drive_open(&url, drive.runtime.handle());
+        let account = AccountId(String::from("race-insert"));
+        let request = RequestId(String::from("race-insert-req"));
+        let key = KeyId(String::from("race-insert-late"));
+        assert!(store.call(store.wallet.deposit(&account, usd(100))).is_ok());
+        let (mut blocker, pid) = blocker(
+            &store,
+            "SELECT available FROM balances WHERE account = $1 AND currency = 'usd' FOR UPDATE",
+            account.0.as_str(),
+        );
+        let pool = store.wallet.pool.clone();
+        let first_account = account.0.clone();
+        let first_request = request.0.clone();
+        let first = drive.runtime.spawn(async move {
+            assert!(
+                waits_on(&pool, pid).await,
+                "hold never waited on the balance row lock"
+            );
+            if let Err(error) = sqlx::query(
+                "INSERT INTO holds (account, request, hold_key, currency, amount, state) VALUES ($1, $2, 'race-insert-first', 'usd', 10, 'open')",
+            )
+            .bind(first_account)
+            .bind(first_request)
+            .execute(&mut *blocker)
+            .await
+            {
+                panic!("{error}");
+            }
+            if let Err(error) = blocker.commit().await {
+                panic!("{error}");
+            }
+        });
+        let result = store.call(store.wallet.hold(&account, &request, &key, None, usd(30)));
+        if let Err(error) = store.call(first) {
+            panic!("{error}");
+        }
+        assert!(matches!(
+            result,
+            Err(WalletError::Rejected(BillingRejection::DuplicateRequest))
+        ));
+        let balance = store.call(store.wallet.balance(&account, Currency::Usd));
+        assert!(matches!(balance, Ok(money) if money == usd(100)));
+    }
+
+    #[test]
+    fn other_insert_failures_stay_storage_errors() {
+        let url = database_url();
+        let drive = TokioDrive::start();
+        let store = drive_open(&url, drive.runtime.handle());
+        let account = AccountId(String::from("insert-fails"));
+        let request = RequestId(String::from("insert-fails-req"));
+        let key = KeyId(String::from("blocked"));
+        assert!(store.call(store.wallet.deposit(&account, usd(100))).is_ok());
+        exec(
+            &store,
+            "ALTER TABLE holds ADD CONSTRAINT holds_reject_blocked CHECK (hold_key <> 'blocked')",
+        );
+        let result = store.call(store.wallet.hold(&account, &request, &key, None, usd(30)));
+        assert!(matches!(
+            result,
+            Err(WalletError::Storage(PostgresError::Database(_)))
+        ));
+        let balance = store.call(store.wallet.balance(&account, Currency::Usd));
+        assert!(matches!(balance, Ok(money) if money == usd(100)));
+    }
 }
