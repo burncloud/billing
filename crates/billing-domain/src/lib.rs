@@ -2,6 +2,7 @@
 
 mod invariant;
 mod posting;
+mod price_book;
 mod pricing;
 
 pub use invariant::{check_ledger, request_held_flat, CurrencyFunds, InvariantViolation};
@@ -9,6 +10,7 @@ pub use posting::{
     post_hold, post_release, post_settle, ExistingHold, HoldRequest, OpenHold, Posted,
     ReleaseRequest, SettleRequest, SpendSoFar, StorageFault, WalletSnapshot,
 };
+pub use price_book::{DuplicateModel, PriceBook, PriceLookupError};
 pub use pricing::{
     ModelPrice, NanosPerMillionTokens, PriceRejection, PricingError, TOKENS_PER_PRICE_UNIT,
 };
