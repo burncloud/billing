@@ -4,7 +4,7 @@ use std::task::{Context, Poll, Waker};
 use std::thread;
 
 use billing::errors::{BillingRejection, WalletError};
-use billing::model::{Direction, Entry, EntryRef, KeyCap, LedgerAccount};
+use billing::model::{Direction, Entry, EntryRef, HoldId, KeyCap, LedgerAccount};
 use billing::ports::Wallet;
 use billing_domain::{
     check_ledger, deposits_in, request_held_flat, AccountFunds, CurrencyFunds, InvariantViolation,
@@ -110,6 +110,7 @@ where
     currencies_do_not_share_revenue(&new_store(), drive);
     concurrent_holds_cannot_both_pass_one_cap(&new_store(), drive);
     concurrent_holds_cannot_share_one_request(&new_store(), drive);
+    hold_token_matches_only_its_open_hold(&new_store(), drive);
     concurrent_accounts_share_one_key_cap(&new_store(), drive);
     accounts_open_and_credits_apply_once(&new_store(), drive);
     only_usd_accounts_are_opened_and_funded(&new_store(), drive);
@@ -142,7 +143,7 @@ fn hold_settle_and_release_keep_the_books<S: WalletContract, D: DriveWallet>(sto
     let held = RequestId(String::from("hold-1"));
     let released = RequestId(String::from("hold-2"));
     must(store.deposit(&account, usd(100)));
-    must(drive.run(Wallet::hold(store, &account, &held, &key, None, usd(40))));
+    let held_id = must(drive.run(Wallet::hold(store, &account, &held, &key, None, usd(40))));
     assert_eq!(available(store, drive, &account), 60);
     assert_eq!(
         request_held_flat(&store.entries(), &account, &held),
@@ -152,10 +153,10 @@ fn hold_settle_and_release_keep_the_books<S: WalletContract, D: DriveWallet>(sto
             credits: 40,
         })
     );
-    must(drive.run(Wallet::settle(store, &account, &held, usd(25))));
+    must(drive.run(Wallet::settle(store, &account, &held, &held_id, usd(25))));
     assert_eq!(available(store, drive, &account), 75);
     assert!(request_held_flat(&store.entries(), &account, &held).is_ok());
-    must(drive.run(Wallet::hold(
+    let released_id = must(drive.run(Wallet::hold(
         store,
         &account,
         &released,
@@ -163,7 +164,7 @@ fn hold_settle_and_release_keep_the_books<S: WalletContract, D: DriveWallet>(sto
         None,
         usd(10),
     )));
-    must(drive.run(Wallet::release(store, &account, &released)));
+    must(drive.run(Wallet::release(store, &account, &released, &released_id)));
     assert_eq!(available(store, drive, &account), 75);
     assert!(request_held_flat(&store.entries(), &account, &released).is_ok());
     let funds = must(store.funds(Currency::Usd));
@@ -182,19 +183,31 @@ fn repeated_terminal_calls_do_not_move_money<S: WalletContract, D: DriveWallet>(
     let key = KeyId(String::from("repeat-key"));
     let request = RequestId(String::from("repeat-req"));
     must(store.deposit(&account, usd(50)));
-    must(drive.run(Wallet::hold(store, &account, &request, &key, None, usd(20))));
+    let request_id = must(drive.run(Wallet::hold(store, &account, &request, &key, None, usd(20))));
     let again = drive.run(Wallet::hold(store, &account, &request, &key, None, usd(20)));
     assert!(matches!(
         again,
         Err(WalletError::Rejected(BillingRejection::DuplicateRequest))
     ));
-    must(drive.run(Wallet::settle(store, &account, &request, usd(20))));
-    let settled = drive.run(Wallet::settle(store, &account, &request, usd(20)));
+    must(drive.run(Wallet::settle(
+        store,
+        &account,
+        &request,
+        &request_id,
+        usd(20),
+    )));
+    let settled = drive.run(Wallet::settle(
+        store,
+        &account,
+        &request,
+        &request_id,
+        usd(20),
+    ));
     assert!(matches!(
         settled,
         Err(WalletError::Rejected(BillingRejection::AlreadySettled))
     ));
-    let released = drive.run(Wallet::release(store, &account, &request));
+    let released = drive.run(Wallet::release(store, &account, &request, &request_id));
     assert!(matches!(
         released,
         Err(WalletError::Rejected(BillingRejection::AlreadySettled))
@@ -203,14 +216,14 @@ fn repeated_terminal_calls_do_not_move_money<S: WalletContract, D: DriveWallet>(
     assert_books(store);
 
     let other = RequestId(String::from("repeat-release"));
-    must(drive.run(Wallet::hold(store, &account, &other, &key, None, usd(5))));
-    must(drive.run(Wallet::release(store, &account, &other)));
-    let twice = drive.run(Wallet::release(store, &account, &other));
+    let other_id = must(drive.run(Wallet::hold(store, &account, &other, &key, None, usd(5))));
+    must(drive.run(Wallet::release(store, &account, &other, &other_id)));
+    let twice = drive.run(Wallet::release(store, &account, &other, &other_id));
     assert!(matches!(
         twice,
         Err(WalletError::Rejected(BillingRejection::AlreadyReleased))
     ));
-    let settle_after = drive.run(Wallet::settle(store, &account, &other, usd(5)));
+    let settle_after = drive.run(Wallet::settle(store, &account, &other, &other_id, usd(5)));
     assert!(matches!(
         settle_after,
         Err(WalletError::Rejected(BillingRejection::AlreadyReleased))
@@ -260,8 +273,14 @@ fn settled_spend_respects_since<S: WalletContract, D: DriveWallet>(store: &S, dr
     let allowed = RequestId(String::from("since-allowed"));
     store.set_now(UnixMillis(10));
     must(store.deposit(&account, usd(200)));
-    must(drive.run(Wallet::hold(store, &account, &settled, &key, None, usd(60))));
-    must(drive.run(Wallet::settle(store, &account, &settled, usd(60))));
+    let settled_id = must(drive.run(Wallet::hold(store, &account, &settled, &key, None, usd(60))));
+    must(drive.run(Wallet::settle(
+        store,
+        &account,
+        &settled,
+        &settled_id,
+        usd(60),
+    )));
     let inside = must(drive.run(Wallet::spent(store, &key, Currency::Usd, UnixMillis(5))));
     let outside = must(drive.run(Wallet::spent(store, &key, Currency::Usd, UnixMillis(20))));
     let at_since = must(drive.run(Wallet::spent(store, &key, Currency::Usd, UnixMillis(10))));
@@ -330,8 +349,14 @@ fn currencies_do_not_share_revenue<S: WalletContract, D: DriveWallet>(store: &S,
     let request = RequestId(String::from("fx-req"));
     must(store.deposit(&account, usd(80)));
     must(store.deposit(&account, cny(70)));
-    must(drive.run(Wallet::hold(store, &account, &request, &key, None, usd(30))));
-    must(drive.run(Wallet::settle(store, &account, &request, usd(30))));
+    let request_id = must(drive.run(Wallet::hold(store, &account, &request, &key, None, usd(30))));
+    must(drive.run(Wallet::settle(
+        store,
+        &account,
+        &request,
+        &request_id,
+        usd(30),
+    )));
     let usd_funds = must(store.funds(Currency::Usd));
     let cny_funds = must(store.funds(Currency::Cny));
     assert_eq!(usd_funds.revenue, 30);
@@ -402,6 +427,10 @@ fn concurrent_holds_cannot_share_one_request<S: WalletContract, D: DriveWallet +
         || drive.run(Wallet::hold(store, &account, &request, &key, None, usd(30))),
     );
     assert_eq!(successes(&left_result, &right_result), 1);
+    let token = match (&left_result, &right_result) {
+        (Ok(token), Err(_)) | (Err(_), Ok(token)) => token.clone(),
+        (Ok(_), Ok(_)) | (Err(_), Err(_)) => unreachable!("同一请求只有一笔冻结成功"),
+    };
     let lost = if left_result.is_err() {
         left_result
     } else {
@@ -411,6 +440,15 @@ fn concurrent_holds_cannot_share_one_request<S: WalletContract, D: DriveWallet +
         lost,
         Err(WalletError::Rejected(BillingRejection::DuplicateRequest))
     ));
+    let wrong = HoldId(String::from("not-the-winner"));
+    assert_ne!(token, wrong);
+    let mismatch = drive.run(Wallet::release(store, &account, &request, &wrong));
+    assert!(matches!(
+        mismatch,
+        Err(WalletError::Rejected(BillingRejection::HoldMismatch))
+    ));
+    assert_eq!(available(store, drive, &account), 70);
+    must(drive.run(Wallet::settle(store, &account, &request, &token, usd(30))));
     assert_eq!(available(store, drive, &account), 70);
     assert_books(store);
 }
@@ -679,8 +717,14 @@ fn credits_write_one_ledger_pair_once<S: WalletContract, D: DriveWallet>(store: 
 
     let request = RequestId(String::from("ledger-req"));
     let key = KeyId(String::from("ledger-key"));
-    must(drive.run(Wallet::hold(store, &account, &request, &key, None, usd(40))));
-    must(drive.run(Wallet::settle(store, &account, &request, usd(25))));
+    let request_id = must(drive.run(Wallet::hold(store, &account, &request, &key, None, usd(40))));
+    must(drive.run(Wallet::settle(
+        store,
+        &account,
+        &request,
+        &request_id,
+        usd(25),
+    )));
     assert_eq!(available(store, drive, &account), 75);
     assert_eq!(available(store, drive, &other), 30);
     assert_eq!(
@@ -719,11 +763,11 @@ fn open_holds_carry_their_creation_time<S: WalletContract, D: DriveWallet>(store
     let closed = RequestId(String::from("aged-closed"));
     must(store.deposit(&account, usd(100)));
     store.set_now(UnixMillis(100));
-    must(drive.run(Wallet::hold(store, &account, &early, &key, None, usd(10))));
-    must(drive.run(Wallet::hold(store, &account, &closed, &key, None, usd(10))));
+    let early_id = must(drive.run(Wallet::hold(store, &account, &early, &key, None, usd(10))));
+    let closed_id = must(drive.run(Wallet::hold(store, &account, &closed, &key, None, usd(10))));
     store.set_now(UnixMillis(200));
     must(drive.run(Wallet::hold(store, &account, &late, &key, None, usd(10))));
-    must(drive.run(Wallet::release(store, &account, &closed)));
+    must(drive.run(Wallet::release(store, &account, &closed, &closed_id)));
     let before_late = must(store.open_holds_created_before(UnixMillis(200)));
     assert_eq!(
         before_late,
@@ -742,10 +786,74 @@ fn open_holds_carry_their_creation_time<S: WalletContract, D: DriveWallet>(store
         .collect();
     assert_eq!(requests, [("aged-early", 100), ("aged-late", 200)]);
     assert_eq!(must(store.open_holds_created_before(UnixMillis(100))), []);
-    must(drive.run(Wallet::settle(store, &account, &early, usd(10))));
+    must(drive.run(Wallet::settle(store, &account, &early, &early_id, usd(10))));
     let after_settle = must(store.open_holds_created_before(UnixMillis(201)));
     assert_eq!(after_settle.len(), 1);
     assert_eq!(after_settle[0].request, late);
+    assert_books(store);
+}
+
+fn hold_token_matches_only_its_open_hold<S: WalletContract, D: DriveWallet>(store: &S, drive: &D) {
+    let account = AccountId(String::from("token"));
+    let key = KeyId(String::from("token-key"));
+    let request = RequestId(String::from("token-req"));
+    let wrong = HoldId(String::from("not-this-hold"));
+    must(store.deposit(&account, usd(100)));
+    let missing = drive.run(Wallet::release(store, &account, &request, &wrong));
+    assert!(matches!(
+        missing,
+        Err(WalletError::Rejected(BillingRejection::HoldNotFound))
+    ));
+    assert!(matches!(
+        drive.run(Wallet::hold(
+            store,
+            &account,
+            &request,
+            &key,
+            None,
+            usd(101)
+        )),
+        Err(WalletError::Rejected(BillingRejection::InsufficientBalance))
+    ));
+    let id = must(drive.run(Wallet::hold(store, &account, &request, &key, None, usd(40))));
+    let other = RequestId(String::from("token-other"));
+    let other_id = must(drive.run(Wallet::hold(store, &account, &other, &key, None, usd(10))));
+    assert_ne!(id, other_id);
+    let blocked = drive.run(Wallet::release(store, &account, &request, &wrong));
+    assert!(matches!(
+        blocked,
+        Err(WalletError::Rejected(BillingRejection::HoldMismatch))
+    ));
+    let settle_blocked = drive.run(Wallet::settle(
+        store,
+        &account,
+        &request,
+        &other_id,
+        usd(10),
+    ));
+    assert!(matches!(
+        settle_blocked,
+        Err(WalletError::Rejected(BillingRejection::HoldMismatch))
+    ));
+    assert_eq!(available(store, drive, &account), 50);
+    must(drive.run(Wallet::settle(store, &account, &request, &id, usd(25))));
+    assert_eq!(available(store, drive, &account), 65);
+    let settled_again = drive.run(Wallet::settle(store, &account, &request, &wrong, usd(25)));
+    assert!(matches!(
+        settled_again,
+        Err(WalletError::Rejected(BillingRejection::AlreadySettled))
+    ));
+    let release_blocked = drive.run(Wallet::release(store, &account, &other, &id));
+    assert!(matches!(
+        release_blocked,
+        Err(WalletError::Rejected(BillingRejection::HoldMismatch))
+    ));
+    must(drive.run(Wallet::release(store, &account, &other, &other_id)));
+    let released_again = drive.run(Wallet::release(store, &account, &other, &wrong));
+    assert!(matches!(
+        released_again,
+        Err(WalletError::Rejected(BillingRejection::AlreadyReleased))
+    ));
     assert_books(store);
 }
 
@@ -767,8 +875,8 @@ fn race<T: Send>(left: impl FnOnce() -> T + Send, right: impl FnOnce() -> T + Se
 }
 
 fn successes(
-    left: &Result<(), WalletError<StorageFault>>,
-    right: &Result<(), WalletError<StorageFault>>,
+    left: &Result<HoldId, WalletError<StorageFault>>,
+    right: &Result<HoldId, WalletError<StorageFault>>,
 ) -> u8 {
     let mut count = 0_u8;
     if left.is_ok() {

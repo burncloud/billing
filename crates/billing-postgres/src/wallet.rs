@@ -1,5 +1,5 @@
 use billing::errors::{BillingRejection, WalletError};
-use billing::model::{Direction, Entry, EntryRef, KeyCap, LedgerAccount};
+use billing::model::{Direction, Entry, EntryRef, HoldId, KeyCap, LedgerAccount};
 use billing::ports::Wallet;
 use billing_domain::{
     post_hold, post_release, post_settle, ExistingHold, HoldRequest, OpenHold, ReleaseRequest,
@@ -76,6 +76,13 @@ fn migrations() -> Vec<Migration> {
             include_str!("../migrations/0005_funding_entries.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            6,
+            "hold_token".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0006_hold_token.sql").into_sql_str(),
+            false,
+        ),
     ]
 }
 
@@ -118,7 +125,7 @@ impl<C: Clock + Sync> Wallet for PostgresWallet<C> {
         key: &KeyId,
         cap: Option<KeyCap>,
         amount: Money,
-    ) -> Result<(), WalletError<Self::Error>> {
+    ) -> Result<HoldId, WalletError<Self::Error>> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
         let result = hold_in(
             &mut tx,
@@ -137,10 +144,11 @@ impl<C: Clock + Sync> Wallet for PostgresWallet<C> {
         &self,
         account: &AccountId,
         request: &RequestId,
+        hold: &HoldId,
         amount: Money,
     ) -> Result<(), WalletError<Self::Error>> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        let result = settle_in(&mut tx, self.clock.now(), account, request, amount).await;
+        let result = settle_in(&mut tx, self.clock.now(), account, request, hold, amount).await;
         finish(tx, result).await
     }
 
@@ -148,9 +156,10 @@ impl<C: Clock + Sync> Wallet for PostgresWallet<C> {
         &self,
         account: &AccountId,
         request: &RequestId,
+        hold: &HoldId,
     ) -> Result<(), WalletError<Self::Error>> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        let result = release_in(&mut tx, self.clock.now(), account, request).await;
+        let result = release_in(&mut tx, self.clock.now(), account, request, hold).await;
         finish(tx, result).await
     }
 
@@ -197,14 +206,14 @@ impl<C: Clock + Sync> Wallet for PostgresWallet<C> {
     }
 }
 
-async fn finish(
+async fn finish<T>(
     tx: Tx<'_>,
-    result: Result<(), WalletError<PostgresError>>,
-) -> Result<(), WalletError<PostgresError>> {
+    result: Result<T, WalletError<PostgresError>>,
+) -> Result<T, WalletError<PostgresError>> {
     match result {
-        Ok(()) => {
+        Ok(value) => {
             tx.commit().await.map_err(storage)?;
-            Ok(())
+            Ok(value)
         }
         Err(error) => Err(error),
     }
@@ -218,9 +227,9 @@ async fn hold_in(
     key: &KeyId,
     cap: Option<KeyCap>,
     amount: Money,
-) -> Result<(), WalletError<PostgresError>> {
+) -> Result<HoldId, WalletError<PostgresError>> {
     lock_key(tx, key).await?;
-    let existing = lock_hold(tx, account, request).await?;
+    let existing = lock_hold(tx, account, request).await?.map(|(hold, _)| hold);
     let balance = lock_balance(tx, account, amount.currency).await?;
     let spent = match cap {
         Some(cap) => spend_in(tx, key, amount.currency, cap.since).await?,
@@ -238,11 +247,11 @@ async fn hold_in(
         spent,
     }))?;
     write_balance(tx, account, posted.balance).await?;
-    insert_open_hold(tx, now, account, request, key, amount).await?;
+    let hold_id = insert_open_hold(tx, now, account, request, key, amount).await?;
     insert_entries(tx, &posted.entries)
         .await
         .map_err(WalletError::Storage)?;
-    Ok(())
+    Ok(hold_id)
 }
 
 async fn settle_in(
@@ -250,17 +259,18 @@ async fn settle_in(
     now: UnixMillis,
     account: &AccountId,
     request: &RequestId,
+    hold: &HoldId,
     amount: Money,
 ) -> Result<(), WalletError<PostgresError>> {
     let Some(key) = peek_key(tx, account, request).await? else {
         return Err(rejected(BillingRejection::HoldNotFound));
     };
     lock_key(tx, &key).await?;
-    let existing = lock_hold(tx, account, request).await?;
-    let Some(ExistingHold::Open(open)) = &existing else {
-        return Err(reject_closed(existing.as_ref()));
+    let Some((existing, stored)) = lock_hold(tx, account, request).await? else {
+        return Err(reject_closed(None));
     };
-    let Some(balance) = lock_balance(tx, account, open.amount.currency).await? else {
+    let currency = open_currency(&existing, &stored, hold)?;
+    let Some(balance) = lock_balance(tx, account, currency).await? else {
         return Err(WalletError::Storage(PostgresError::MissingBalance));
     };
     let posted = from_domain(post_settle(&SettleRequest {
@@ -269,7 +279,7 @@ async fn settle_in(
         amount,
         at: now,
         balance,
-        existing,
+        existing: Some(existing),
     }))?;
     write_balance(tx, account, posted.balance).await?;
     set_hold_state(tx, account, request, "settled").await?;
@@ -284,18 +294,16 @@ async fn release_in(
     now: UnixMillis,
     account: &AccountId,
     request: &RequestId,
+    hold: &HoldId,
 ) -> Result<(), WalletError<PostgresError>> {
     let Some(key) = peek_key(tx, account, request).await? else {
         return Err(rejected(BillingRejection::HoldNotFound));
     };
     lock_key(tx, &key).await?;
-    let existing = lock_hold(tx, account, request).await?;
-    let currency = match &existing {
-        Some(ExistingHold::Open(open)) => open.amount.currency,
-        Some(ExistingHold::Settled | ExistingHold::Released) | None => {
-            return Err(reject_closed(existing.as_ref()));
-        }
+    let Some((existing, stored)) = lock_hold(tx, account, request).await? else {
+        return Err(reject_closed(None));
     };
+    let currency = open_currency(&existing, &stored, hold)?;
     let Some(balance) = lock_balance(tx, account, currency).await? else {
         return Err(WalletError::Storage(PostgresError::MissingBalance));
     };
@@ -304,7 +312,7 @@ async fn release_in(
         request,
         at: now,
         balance,
-        existing,
+        existing: Some(existing),
     }))?;
     write_balance(tx, account, posted.balance).await?;
     set_hold_state(tx, account, request, "released").await?;
@@ -312,6 +320,20 @@ async fn release_in(
         .await
         .map_err(WalletError::Storage)?;
     Ok(())
+}
+
+fn open_currency(
+    existing: &ExistingHold,
+    stored: &HoldId,
+    presented: &HoldId,
+) -> Result<Currency, WalletError<PostgresError>> {
+    let ExistingHold::Open(open) = existing else {
+        return Err(reject_closed(Some(existing)));
+    };
+    if stored != presented {
+        return Err(rejected(BillingRejection::HoldMismatch));
+    }
+    Ok(open.amount.currency)
 }
 
 async fn lock_key(tx: &mut Tx<'_>, key: &KeyId) -> Result<(), WalletError<PostgresError>> {
@@ -364,9 +386,9 @@ async fn lock_hold(
     tx: &mut Tx<'_>,
     account: &AccountId,
     request: &RequestId,
-) -> Result<Option<ExistingHold>, WalletError<PostgresError>> {
+) -> Result<Option<(ExistingHold, HoldId)>, WalletError<PostgresError>> {
     let row = sqlx::query(
-        "SELECT hold_key, currency, amount, state FROM holds WHERE account = $1 AND request = $2 FOR UPDATE",
+        "SELECT hold_key, currency, amount, state, hold_token FROM holds WHERE account = $1 AND request = $2 FOR UPDATE",
     )
     .bind(account.0.as_str())
     .bind(request.0.as_str())
@@ -375,7 +397,10 @@ async fn lock_hold(
     .map_err(storage)?;
     match row {
         None => Ok(None),
-        Some(row) => Ok(Some(hold_from_row(&row)?)),
+        Some(row) => {
+            let token = HoldId(row.try_get::<String, _>("hold_token").map_err(storage)?);
+            Ok(Some((hold_from_row(&row)?, token)))
+        }
     }
 }
 
@@ -478,9 +503,9 @@ async fn insert_open_hold(
     request: &RequestId,
     key: &KeyId,
     amount: Money,
-) -> Result<(), WalletError<PostgresError>> {
-    let result = sqlx::query(
-        "INSERT INTO holds (account, request, hold_key, currency, amount, state, created_at) VALUES ($1, $2, $3, $4, $5, 'open', $6)",
+) -> Result<HoldId, WalletError<PostgresError>> {
+    let result = sqlx::query_scalar(
+        "INSERT INTO holds (account, request, hold_key, currency, amount, state, created_at, hold_token) VALUES ($1, $2, $3, $4, $5, 'open', $6, gen_random_uuid()::text) RETURNING hold_token",
     )
     .bind(account.0.as_str())
     .bind(request.0.as_str())
@@ -488,10 +513,10 @@ async fn insert_open_hold(
     .bind(currency_code(amount.currency))
     .bind(to_i64(amount.minor_units)?)
     .bind(clock_i64(now)?)
-    .execute(&mut **tx)
+    .fetch_one(&mut **tx)
     .await;
     match result {
-        Ok(_) => Ok(()),
+        Ok(token) => Ok(HoldId(token)),
         Err(error) if is_unique(&error) => Err(rejected(BillingRejection::DuplicateRequest)),
         Err(error) => Err(storage(error)),
     }
@@ -706,6 +731,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use billing::errors::{BillingRejection, WalletError};
+    use billing::model::HoldId;
     use billing::ports::Wallet;
     use billing_domain::{
         credit_entries, CreditId, Credited, FundingError, Opened, PendingHold, StorageFault,
@@ -916,7 +942,7 @@ mod tests {
             key: &kernel::model::KeyId,
             cap: Option<billing::model::KeyCap>,
             amount: Money,
-        ) -> impl Future<Output = Result<(), WalletError<Self::Error>>> + Send {
+        ) -> impl Future<Output = Result<HoldId, WalletError<Self::Error>>> + Send {
             std::future::ready(adapt(
                 self.call(self.wallet.hold(account, request, key, cap, amount)),
             ))
@@ -926,10 +952,11 @@ mod tests {
             &self,
             account: &kernel::model::AccountId,
             request: &kernel::model::RequestId,
+            hold: &HoldId,
             amount: Money,
         ) -> impl Future<Output = Result<(), WalletError<Self::Error>>> + Send {
             std::future::ready(adapt(
-                self.call(self.wallet.settle(account, request, amount)),
+                self.call(self.wallet.settle(account, request, hold, amount)),
             ))
         }
 
@@ -937,8 +964,11 @@ mod tests {
             &self,
             account: &kernel::model::AccountId,
             request: &kernel::model::RequestId,
+            hold: &HoldId,
         ) -> impl Future<Output = Result<(), WalletError<Self::Error>>> + Send {
-            std::future::ready(adapt(self.call(self.wallet.release(account, request))))
+            std::future::ready(adapt(
+                self.call(self.wallet.release(account, request, hold)),
+            ))
         }
 
         fn held(
@@ -1240,11 +1270,17 @@ mod tests {
             minor_units,
         };
         assert!(store.call(store.wallet.deposit(&account, usd(200))).is_ok());
+        let settled_id =
+            match store.call(store.wallet.hold(&account, &settled, &key, None, usd(60))) {
+                Ok(id) => id,
+                Err(error) => panic!("{error:?}"),
+            };
         assert!(store
-            .call(store.wallet.hold(&account, &settled, &key, None, usd(60)))
-            .is_ok());
-        assert!(store
-            .call(store.wallet.settle(&account, &settled, usd(60)))
+            .call(
+                store
+                    .wallet
+                    .settle(&account, &settled, &settled_id, usd(60))
+            )
             .is_ok());
         assert!(store
             .call(store.wallet.hold(&account, &open, &key, None, usd(40)))
@@ -1371,7 +1407,7 @@ mod tests {
                 "hold never waited on the balance row lock"
             );
             if let Err(error) = sqlx::query(
-                "INSERT INTO holds (account, request, hold_key, currency, amount, state, created_at) VALUES ($1, $2, 'race-insert-first', 'usd', 10, 'open', 0)",
+                "INSERT INTO holds (account, request, hold_key, currency, amount, state, created_at, hold_token) VALUES ($1, $2, 'race-insert-first', 'usd', 10, 'open', 0, 'race-insert-token')",
             )
             .bind(first_account)
             .bind(first_request)

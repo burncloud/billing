@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use billing::errors::{BillingRejection, WalletError};
-use billing::model::{Direction, Entry, KeyCap, LedgerAccount};
+use billing::model::{Direction, Entry, HoldId, KeyCap, LedgerAccount};
 use billing::ports::Wallet;
 use billing_domain::{
     check_funding_currency, credit_entries, post_credit, post_hold, post_release, post_settle,
@@ -26,6 +26,8 @@ struct State {
     deposits: HashMap<BalanceKey, u64>,
     holds: HashMap<HoldKey, ExistingHold>,
     hold_created: HashMap<HoldKey, UnixMillis>,
+    hold_tokens: HashMap<HoldKey, HoldId>,
+    next_hold: u64,
     credits: HashMap<(AccountId, CreditId), Money>,
     entries: Vec<Entry>,
 }
@@ -68,6 +70,8 @@ impl<C> MemoryWallet<C> {
                 deposits: HashMap::new(),
                 holds: HashMap::new(),
                 hold_created: HashMap::new(),
+                hold_tokens: HashMap::new(),
+                next_hold: 0,
                 credits: HashMap::new(),
                 entries: Vec::new(),
             }),
@@ -304,7 +308,7 @@ impl<C: Clock + Sync> MemoryWallet<C> {
         key: &KeyId,
         cap: Option<KeyCap>,
         amount: Money,
-    ) -> Result<(), WalletError<StorageFault>> {
+    ) -> Result<HoldId, WalletError<StorageFault>> {
         let mut state = self.lock();
         let balance_key = (account.clone(), amount.currency);
         let balance = state.balances.get(&balance_key).copied();
@@ -328,35 +332,38 @@ impl<C: Clock + Sync> MemoryWallet<C> {
             existing,
             spent,
         })?;
+        let hold_id = next_hold_id(&mut state)?;
+        let hold_key = (account.clone(), request.clone());
         state.balances.insert(balance_key, posted.balance);
         state.holds.insert(
-            (account.clone(), request.clone()),
+            hold_key.clone(),
             ExistingHold::Open(OpenHold {
                 key: key.clone(),
                 amount,
             }),
         );
-        state
-            .hold_created
-            .insert((account.clone(), request.clone()), now);
+        state.hold_created.insert(hold_key.clone(), now);
+        state.hold_tokens.insert(hold_key, hold_id.clone());
         state.entries.extend(posted.entries);
-        Ok(())
+        Ok(hold_id)
     }
 
     fn settle_sync(
         &self,
         account: &AccountId,
         request: &RequestId,
+        hold: &HoldId,
         amount: Money,
     ) -> Result<(), WalletError<StorageFault>> {
         let mut state = self.lock();
-        let existing = state
-            .holds
-            .get(&(account.clone(), request.clone()))
-            .cloned();
+        let hold_key = (account.clone(), request.clone());
+        let existing = state.holds.get(&hold_key).cloned();
         let Some(ExistingHold::Open(open)) = &existing else {
             return Err(reject_closed(existing.as_ref()));
         };
+        if state.hold_tokens.get(&hold_key) != Some(hold) {
+            return Err(WalletError::Rejected(BillingRejection::HoldMismatch));
+        }
         let balance_key = (account.clone(), open.amount.currency);
         let Some(balance) = state.balances.get(&balance_key).copied() else {
             return Err(WalletError::Storage(StorageFault::MissingBalance));
@@ -382,18 +389,20 @@ impl<C: Clock + Sync> MemoryWallet<C> {
         &self,
         account: &AccountId,
         request: &RequestId,
+        hold: &HoldId,
     ) -> Result<(), WalletError<StorageFault>> {
         let mut state = self.lock();
-        let existing = state
-            .holds
-            .get(&(account.clone(), request.clone()))
-            .cloned();
+        let hold_key = (account.clone(), request.clone());
+        let existing = state.holds.get(&hold_key).cloned();
         let currency = match &existing {
             Some(ExistingHold::Open(open)) => open.amount.currency,
             Some(ExistingHold::Settled | ExistingHold::Released) | None => {
                 return Err(reject_closed(existing.as_ref()));
             }
         };
+        if state.hold_tokens.get(&hold_key) != Some(hold) {
+            return Err(WalletError::Rejected(BillingRejection::HoldMismatch));
+        }
         let balance_key = (account.clone(), currency);
         let Some(balance) = state.balances.get(&balance_key).copied() else {
             return Err(WalletError::Storage(StorageFault::MissingBalance));
@@ -407,7 +416,7 @@ impl<C: Clock + Sync> MemoryWallet<C> {
             existing,
         })?;
         state.balances.insert(balance_key, posted.balance);
-        if let Some(slot) = state.holds.get_mut(&(account.clone(), request.clone())) {
+        if let Some(slot) = state.holds.get_mut(&hold_key) {
             *slot = ExistingHold::Released;
         }
         state.entries.extend(posted.entries);
@@ -479,7 +488,7 @@ impl<C: Clock + Sync> Wallet for MemoryWallet<C> {
         key: &KeyId,
         cap: Option<KeyCap>,
         amount: Money,
-    ) -> impl Future<Output = Result<(), WalletError<Self::Error>>> + Send {
+    ) -> impl Future<Output = Result<HoldId, WalletError<Self::Error>>> + Send {
         std::future::ready(Self::hold_sync(self, account, request, key, cap, amount))
     }
 
@@ -487,17 +496,19 @@ impl<C: Clock + Sync> Wallet for MemoryWallet<C> {
         &self,
         account: &AccountId,
         request: &RequestId,
+        hold: &HoldId,
         amount: Money,
     ) -> impl Future<Output = Result<(), WalletError<Self::Error>>> + Send {
-        std::future::ready(Self::settle_sync(self, account, request, amount))
+        std::future::ready(Self::settle_sync(self, account, request, hold, amount))
     }
 
     fn release(
         &self,
         account: &AccountId,
         request: &RequestId,
+        hold: &HoldId,
     ) -> impl Future<Output = Result<(), WalletError<Self::Error>>> + Send {
-        std::future::ready(Self::release_sync(self, account, request))
+        std::future::ready(Self::release_sync(self, account, request, hold))
     }
 
     fn held(
@@ -516,6 +527,15 @@ impl<C: Clock + Sync> Wallet for MemoryWallet<C> {
     ) -> impl Future<Output = Result<Money, WalletError<Self::Error>>> + Send {
         std::future::ready(Self::spent_sync(self, key, currency, since))
     }
+}
+
+fn next_hold_id(state: &mut State) -> Result<HoldId, WalletError<StorageFault>> {
+    let next = state
+        .next_hold
+        .checked_add(1)
+        .ok_or(WalletError::Rejected(BillingRejection::Overflow))?;
+    state.next_hold = next;
+    Ok(HoldId(next.to_string()))
 }
 
 fn reject_closed(existing: Option<&ExistingHold>) -> WalletError<StorageFault> {
