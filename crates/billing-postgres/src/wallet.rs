@@ -1,5 +1,5 @@
 use billing::errors::{BillingRejection, WalletError};
-use billing::model::{Direction, Entry, EntryRef, HoldId, KeyCap, LedgerAccount};
+use billing::model::{Direction, Entry, EntryRef, HoldId, KeyCap, LedgerAccount, PendingHold};
 use billing::ports::Wallet;
 use billing_domain::{
     post_hold, post_release, post_settle, ExistingHold, HoldRequest, OpenHold, ReleaseRequest,
@@ -203,6 +203,15 @@ impl<C: Clock + Sync> Wallet for PostgresWallet<C> {
             .checked_add(spent.open.minor_units)
             .ok_or(rejected(BillingRejection::Overflow))?;
         Ok(money(currency, minor_units))
+    }
+
+    async fn open_holds_created_before(
+        &self,
+        cutoff: UnixMillis,
+    ) -> Result<Vec<PendingHold>, WalletError<Self::Error>> {
+        self.list_open_holds(cutoff)
+            .await
+            .map_err(WalletError::Storage)
     }
 }
 
@@ -732,7 +741,7 @@ mod tests {
 
     use billing::errors::{BillingRejection, WalletError};
     use billing::model::HoldId;
-    use billing::ports::Wallet;
+    use billing::ports::{Funding, Wallet};
     use billing_domain::{
         credit_entries, CreditId, Credited, FundingError, Opened, PendingHold, StorageFault,
     };
@@ -987,6 +996,16 @@ mod tests {
         ) -> impl Future<Output = Result<Money, WalletError<Self::Error>>> + Send {
             std::future::ready(adapt(self.call(self.wallet.spent(key, currency, since))))
         }
+
+        fn open_holds_created_before(
+            &self,
+            cutoff: UnixMillis,
+        ) -> impl Future<Output = Result<Vec<PendingHold>, WalletError<Self::Error>>> + Send
+        {
+            std::future::ready(adapt(
+                self.call(Wallet::open_holds_created_before(&self.wallet, cutoff)),
+            ))
+        }
     }
 
     impl WalletContract for PgContract {
@@ -1028,7 +1047,7 @@ mod tests {
             account: &AccountId,
             currency: Currency,
         ) -> Result<Opened, FundingError<StorageFault>> {
-            match self.call(self.wallet.open_account(account, currency)) {
+            match self.call(Funding::open_account(&self.wallet, account, currency)) {
                 Ok(opened) => Ok(opened),
                 Err(FundingError::Rejected(reason)) => Err(FundingError::Rejected(reason)),
                 Err(FundingError::Storage(error)) => panic!("{error:?}"),
@@ -1041,21 +1060,11 @@ mod tests {
             credit: &CreditId,
             amount: Money,
         ) -> Result<Credited, FundingError<StorageFault>> {
-            match self.call(self.wallet.credit(account, credit, amount)) {
+            match self.call(Funding::credit(&self.wallet, account, credit, amount)) {
                 Ok(credited) => Ok(credited),
                 Err(FundingError::Rejected(reason)) => Err(FundingError::Rejected(reason)),
                 Err(FundingError::Storage(error)) => panic!("{error:?}"),
             }
-        }
-
-        fn open_holds_created_before(
-            &self,
-            cutoff: UnixMillis,
-        ) -> Result<Vec<PendingHold>, WalletError<StorageFault>> {
-            adapt(
-                self.call(self.wallet.open_holds_created_before(cutoff))
-                    .map_err(WalletError::Storage),
-            )
         }
     }
 

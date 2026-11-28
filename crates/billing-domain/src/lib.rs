@@ -6,9 +6,11 @@ mod posting;
 mod price_book;
 mod pricing;
 
+pub use billing::errors::{FundingError, FundingRejection};
+pub use billing::model::{Credited, Opened, PendingHold};
 pub use funding::{
     check_funding_currency, credit_entries, post_credit, CreditApplied, CreditPosting,
-    CreditRequest, Credited, FundingError, FundingRejection, FundingRow, Opened, PendingHold,
+    CreditRequest, FundingRow,
 };
 pub use invariant::{
     check_ledger, deposits_in, request_held_flat, AccountFunds, CurrencyFunds, InvariantViolation,

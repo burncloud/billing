@@ -1,35 +1,8 @@
+use billing::errors::FundingRejection;
 use billing::model::{Entry, EntryRef, LedgerAccount};
-use kernel::model::{AccountId, CreditId, Currency, KeyId, Money, RequestId, UnixMillis};
+use kernel::model::{AccountId, CreditId, Currency, Money, UnixMillis};
 
 use crate::posting::push_pair;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Opened {
-    Created,
-    AlreadyOpen,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Credited {
-    Applied,
-    AlreadyApplied,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FundingRejection {
-    UnsupportedCurrency,
-    EmptyCreditId,
-    ZeroAmount,
-    NotOpened,
-    ConflictingCredit,
-    Overflow,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum FundingError<E> {
-    Rejected(FundingRejection),
-    Storage(E),
-}
 
 /// 首期只给 USD 开户和入账。
 ///
@@ -79,10 +52,12 @@ pub enum CreditPosting {
 ///
 /// # Errors
 ///
+/// 多个条件同时成立时返回下面最先写出的那个。`Funding` 没有规定这个顺序。
 /// 单号为空时返回 `FundingRejection::EmptyCreditId`。
 /// 金额为 0 时返回 `FundingRejection::ZeroAmount`。
 /// 币种不是 USD 时返回 `FundingRejection::UnsupportedCurrency`。
-/// 单号已记过、但金额不同时返回 `FundingRejection::ConflictingCredit`。
+/// 单号已记过且金额相同时返回 `CreditPosting::AlreadyApplied`，不看有没有余额行。
+/// 单号已记过但金额不同时返回 `FundingRejection::ConflictingCredit`。
 /// 没有余额行时返回 `FundingRejection::NotOpened`。
 /// 相加溢出时返回 `FundingRejection::Overflow`。
 pub fn post_credit(request: &CreditRequest<'_>) -> Result<CreditPosting, FundingRejection> {
@@ -138,24 +113,15 @@ pub fn credit_entries(
     entries
 }
 
-/// 还没结算或释放的冻结。`created_at` 是冻结写入时钱包时钟的时刻。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PendingHold {
-    pub account: AccountId,
-    pub request: RequestId,
-    pub key: KeyId,
-    pub amount: Money,
-    pub created_at: UnixMillis,
-}
-
 #[cfg(test)]
 mod tests {
+    use billing::errors::FundingRejection;
     use billing::model::{Direction, Entry, EntryRef, LedgerAccount};
     use kernel::model::{AccountId, CreditId, Currency, Money, UnixMillis};
 
     use super::{
         check_funding_currency, post_credit, CreditApplied, CreditPosting, CreditRequest,
-        FundingRejection, FundingRow,
+        FundingRow,
     };
 
     fn usd(minor_units: u64) -> Money {

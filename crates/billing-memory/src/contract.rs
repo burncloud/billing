@@ -48,16 +48,6 @@ pub trait WalletContract: Wallet<Error = StorageFault> + Sync {
         amount: Money,
     ) -> Result<billing_domain::Credited, billing_domain::FundingError<StorageFault>>;
 
-    /// 按 `created_at`、账户、请求排序。
-    ///
-    /// # Errors
-    ///
-    /// 存储失败时返回 `WalletError::Storage`。
-    fn open_holds_created_before(
-        &self,
-        cutoff: UnixMillis,
-    ) -> Result<Vec<billing_domain::PendingHold>, WalletError<StorageFault>>;
-
     /// # Errors
     ///
     /// 合计溢出时返回 `WalletError::Rejected(BillingRejection::Overflow)`。
@@ -768,10 +758,11 @@ fn open_holds_carry_their_creation_time<S: WalletContract, D: DriveWallet>(store
     store.set_now(UnixMillis(200));
     must(drive.run(Wallet::hold(store, &account, &late, &key, None, usd(10))));
     must(drive.run(Wallet::release(store, &account, &closed, &closed_id)));
-    let before_late = must(store.open_holds_created_before(UnixMillis(200)));
+    let before_late = must(drive.run(Wallet::open_holds_created_before(store, UnixMillis(200))));
     assert_eq!(
         before_late,
         vec![PendingHold {
+            hold: early_id.clone(),
             account: account.clone(),
             request: early.clone(),
             key: key.clone(),
@@ -779,15 +770,18 @@ fn open_holds_carry_their_creation_time<S: WalletContract, D: DriveWallet>(store
             created_at: UnixMillis(100),
         }]
     );
-    let all = must(store.open_holds_created_before(UnixMillis(201)));
+    let all = must(drive.run(Wallet::open_holds_created_before(store, UnixMillis(201))));
     let requests: Vec<(&str, u64)> = all
         .iter()
         .map(|hold| (hold.request.0.as_str(), hold.created_at.0))
         .collect();
     assert_eq!(requests, [("aged-early", 100), ("aged-late", 200)]);
-    assert_eq!(must(store.open_holds_created_before(UnixMillis(100))), []);
+    assert_eq!(
+        must(drive.run(Wallet::open_holds_created_before(store, UnixMillis(100)))),
+        []
+    );
     must(drive.run(Wallet::settle(store, &account, &early, &early_id, usd(10))));
-    let after_settle = must(store.open_holds_created_before(UnixMillis(201)));
+    let after_settle = must(drive.run(Wallet::open_holds_created_before(store, UnixMillis(201))));
     assert_eq!(after_settle.len(), 1);
     assert_eq!(after_settle[0].request, late);
     assert_books(store);

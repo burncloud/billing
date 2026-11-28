@@ -5,7 +5,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use billing::errors::{BillingRejection, WalletError};
 use billing::model::{Direction, Entry, HoldId, KeyCap, LedgerAccount};
-use billing::ports::Wallet;
+use billing::ports::{Funding, Wallet};
 use billing_domain::{
     check_funding_currency, credit_entries, post_credit, post_hold, post_release, post_settle,
     AccountFunds, CreditId, CreditPosting, CreditRequest, Credited, CurrencyFunds, ExistingHold,
@@ -225,40 +225,6 @@ impl WalletContract for MemoryWallet<ManualClock> {
         Ok(Credited::Applied)
     }
 
-    fn open_holds_created_before(
-        &self,
-        cutoff: UnixMillis,
-    ) -> Result<Vec<PendingHold>, WalletError<StorageFault>> {
-        let state = self.lock();
-        let mut pending = Vec::new();
-        for ((account, request), hold) in &state.holds {
-            let ExistingHold::Open(open) = hold else {
-                continue;
-            };
-            let Some(created_at) = state.hold_created.get(&(account.clone(), request.clone()))
-            else {
-                continue;
-            };
-            if *created_at < cutoff {
-                pending.push(PendingHold {
-                    account: account.clone(),
-                    request: request.clone(),
-                    key: open.key.clone(),
-                    amount: open.amount,
-                    created_at: *created_at,
-                });
-            }
-        }
-        pending.sort_by(|left, right| {
-            (left.created_at, &left.account.0, &left.request.0).cmp(&(
-                right.created_at,
-                &right.account.0,
-                &right.request.0,
-            ))
-        });
-        Ok(pending)
-    }
-
     fn funds(&self, currency: Currency) -> Result<CurrencyFunds, WalletError<StorageFault>> {
         let state = self.lock();
         let mut available = 0_u64;
@@ -450,6 +416,41 @@ impl<C: Clock + Sync> MemoryWallet<C> {
         }
     }
 
+    fn open_holds_sync(&self, cutoff: UnixMillis) -> Vec<PendingHold> {
+        let state = self.lock();
+        let mut pending = Vec::new();
+        for ((account, request), hold) in &state.holds {
+            let ExistingHold::Open(open) = hold else {
+                continue;
+            };
+            let hold_key = (account.clone(), request.clone());
+            let Some(created_at) = state.hold_created.get(&hold_key).copied() else {
+                continue;
+            };
+            let Some(hold_id) = state.hold_tokens.get(&hold_key).cloned() else {
+                continue;
+            };
+            if created_at < cutoff {
+                pending.push(PendingHold {
+                    hold: hold_id,
+                    account: account.clone(),
+                    request: request.clone(),
+                    key: open.key.clone(),
+                    amount: open.amount,
+                    created_at,
+                });
+            }
+        }
+        pending.sort_by(|left, right| {
+            (left.created_at, &left.account.0, &left.request.0).cmp(&(
+                right.created_at,
+                &right.account.0,
+                &right.request.0,
+            ))
+        });
+        pending
+    }
+
     fn spent_sync(
         &self,
         key: &KeyId,
@@ -526,6 +527,34 @@ impl<C: Clock + Sync> Wallet for MemoryWallet<C> {
         since: UnixMillis,
     ) -> impl Future<Output = Result<Money, WalletError<Self::Error>>> + Send {
         std::future::ready(Self::spent_sync(self, key, currency, since))
+    }
+
+    fn open_holds_created_before(
+        &self,
+        cutoff: UnixMillis,
+    ) -> impl Future<Output = Result<Vec<PendingHold>, WalletError<Self::Error>>> + Send {
+        std::future::ready(Ok(self.open_holds_sync(cutoff)))
+    }
+}
+
+impl Funding for MemoryWallet<ManualClock> {
+    type Error = StorageFault;
+
+    fn open_account(
+        &self,
+        account: &AccountId,
+        currency: Currency,
+    ) -> impl Future<Output = Result<Opened, FundingError<Self::Error>>> + Send {
+        std::future::ready(WalletContract::open_account(self, account, currency))
+    }
+
+    fn credit(
+        &self,
+        account: &AccountId,
+        credit: &CreditId,
+        amount: Money,
+    ) -> impl Future<Output = Result<Credited, FundingError<Self::Error>>> + Send {
+        std::future::ready(WalletContract::credit(self, account, credit, amount))
     }
 }
 
