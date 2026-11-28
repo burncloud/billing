@@ -144,6 +144,14 @@ fn hold_settle_and_release_keep_the_books<S: WalletContract, D: DriveWallet>(sto
     must(store.deposit(&account, usd(100)));
     must(drive.run(Wallet::hold(store, &account, &held, &key, None, usd(40))));
     assert_eq!(available(store, drive, &account), 60);
+    assert_eq!(
+        request_held_flat(&store.entries(), &account, &held),
+        Err(InvariantViolation::Unbalanced {
+            currency: Currency::Usd,
+            debits: 0,
+            credits: 40,
+        })
+    );
     must(drive.run(Wallet::settle(store, &account, &held, usd(25))));
     assert_eq!(available(store, drive, &account), 75);
     assert!(request_held_flat(&store.entries(), &account, &held).is_ok());
@@ -256,7 +264,9 @@ fn settled_spend_respects_since<S: WalletContract, D: DriveWallet>(store: &S, dr
     must(drive.run(Wallet::settle(store, &account, &settled, usd(60))));
     let inside = must(drive.run(Wallet::spent(store, &key, Currency::Usd, UnixMillis(5))));
     let outside = must(drive.run(Wallet::spent(store, &key, Currency::Usd, UnixMillis(20))));
+    let at_since = must(drive.run(Wallet::spent(store, &key, Currency::Usd, UnixMillis(10))));
     assert_eq!(inside.minor_units, 60);
+    assert_eq!(at_since.minor_units, 60);
     assert_eq!(outside.minor_units, 0);
     let tight = KeyCap {
         since: UnixMillis(5),
@@ -292,6 +302,25 @@ fn settled_spend_respects_since<S: WalletContract, D: DriveWallet>(store: &S, dr
         must(drive.run(Wallet::spent(store, &key, Currency::Usd, UnixMillis(20))));
     assert_eq!(with_hold_inside.minor_units, 110);
     assert_eq!(with_hold_outside.minor_units, 50);
+    let other_key = KeyId(String::from("since-other-key"));
+    let other = RequestId(String::from("since-other"));
+    must(drive.run(Wallet::hold(
+        store,
+        &account,
+        &other,
+        &other_key,
+        None,
+        usd(30),
+    )));
+    let after_other = must(drive.run(Wallet::spent(store, &key, Currency::Usd, UnixMillis(5))));
+    let other_spent = must(drive.run(Wallet::spent(
+        store,
+        &other_key,
+        Currency::Usd,
+        UnixMillis(5),
+    )));
+    assert_eq!(after_other.minor_units, 110);
+    assert_eq!(other_spent.minor_units, 30);
     assert_books(store);
 }
 
