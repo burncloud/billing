@@ -1,3 +1,7 @@
+use std::future::Future;
+
+use billing::model::HoldId;
+use billing::ports::Funding;
 use billing_domain::{
     check_funding_currency, post_credit, CreditPosting, CreditRequest, Credited, FundingError,
     FundingRejection, FundingRow, Opened, PendingHold,
@@ -57,17 +61,12 @@ impl<C: Clock + Sync> PostgresWallet<C> {
         Ok(credited)
     }
 
-    /// 按 `created_at`、账户、请求排序。
-    ///
-    /// # Errors
-    ///
-    /// 数据库失败或读到坏数据时返回 `PostgresError`。
-    pub async fn open_holds_created_before(
+    pub(super) async fn list_open_holds(
         &self,
         cutoff: UnixMillis,
     ) -> Result<Vec<PendingHold>, PostgresError> {
         let rows = sqlx::query(
-            "SELECT account, request, hold_key, currency, amount, created_at FROM holds WHERE state = 'open' AND created_at < $1 ORDER BY created_at, account COLLATE \"C\", request COLLATE \"C\"",
+            "SELECT hold_token, account, request, hold_key, currency, amount, created_at FROM holds WHERE state = 'open' AND created_at < $1 ORDER BY created_at, account COLLATE \"C\", request COLLATE \"C\"",
         )
         .bind(i64::try_from(cutoff.0).unwrap_or(i64::MAX))
         .fetch_all(&self.pool)
@@ -77,6 +76,7 @@ impl<C: Clock + Sync> PostgresWallet<C> {
         for row in rows {
             let currency: String = row.try_get("currency").map_err(database)?;
             pending.push(PendingHold {
+                hold: HoldId(row.try_get("hold_token").map_err(database)?),
                 account: AccountId(row.try_get("account").map_err(database)?),
                 request: RequestId(row.try_get("request").map_err(database)?),
                 key: KeyId(row.try_get("hold_key").map_err(database)?),
@@ -85,6 +85,27 @@ impl<C: Clock + Sync> PostgresWallet<C> {
             });
         }
         Ok(pending)
+    }
+}
+
+impl<C: Clock + Sync> Funding for PostgresWallet<C> {
+    type Error = PostgresError;
+
+    fn open_account(
+        &self,
+        account: &AccountId,
+        currency: Currency,
+    ) -> impl Future<Output = Result<Opened, FundingError<Self::Error>>> + Send {
+        PostgresWallet::open_account(self, account, currency)
+    }
+
+    fn credit(
+        &self,
+        account: &AccountId,
+        credit: &CreditId,
+        amount: Money,
+    ) -> impl Future<Output = Result<Credited, FundingError<Self::Error>>> + Send {
+        PostgresWallet::credit(self, account, credit, amount)
     }
 }
 
