@@ -106,7 +106,7 @@ where
     only_usd_accounts_are_opened_and_funded(&new_store(), drive);
     credits_write_one_ledger_pair_once(&new_store(), drive);
     deposits_and_credits_share_the_ledger(&new_store(), drive);
-    open_holds_carry_their_creation_time(&new_store(), drive);
+    open_holds_keep_saved_ids_in_order(&new_store(), drive);
 }
 
 fn missing_row_is_not_created<S: WalletContract, D: DriveWallet>(store: &S, drive: &D) {
@@ -510,6 +510,20 @@ fn accounts_open_and_credits_apply_once<S: WalletContract, D: DriveWallet>(store
         Err(WalletError::Storage(StorageFault::MissingBalance))
     ));
     assert_eq!(
+        store.credit(&account, &CreditId(String::new()), usd(0)),
+        Err(FundingError::Rejected(FundingRejection::EmptyCreditId))
+    );
+    assert_eq!(
+        store.credit(&account, &CreditId(String::from("credit-zero")), usd(0)),
+        Err(FundingError::Rejected(FundingRejection::ZeroAmount))
+    );
+    assert_eq!(
+        store.credit(&account, &first, cny(1)),
+        Err(FundingError::Rejected(
+            FundingRejection::UnsupportedCurrency
+        ))
+    );
+    assert_eq!(
         store.credit(&account, &first, usd(100)),
         Err(FundingError::Rejected(FundingRejection::NotOpened))
     );
@@ -743,47 +757,119 @@ fn deposits_and_credits_share_the_ledger<S: WalletContract, D: DriveWallet>(stor
     assert_books(store);
 }
 
-fn open_holds_carry_their_creation_time<S: WalletContract, D: DriveWallet>(store: &S, drive: &D) {
+fn open_holds_keep_saved_ids_in_order<S: WalletContract, D: DriveWallet>(store: &S, drive: &D) {
     use billing_domain::PendingHold;
 
-    let account = AccountId(String::from("aged"));
-    let key = KeyId(String::from("aged-key"));
-    let early = RequestId(String::from("aged-early"));
-    let late = RequestId(String::from("aged-late"));
-    let closed = RequestId(String::from("aged-closed"));
-    must(store.deposit(&account, usd(100)));
-    store.set_now(UnixMillis(100));
-    let early_id = must(drive.run(Wallet::hold(store, &account, &early, &key, None, usd(10))));
-    let closed_id = must(drive.run(Wallet::hold(store, &account, &closed, &key, None, usd(10))));
-    store.set_now(UnixMillis(200));
-    must(drive.run(Wallet::hold(store, &account, &late, &key, None, usd(10))));
-    must(drive.run(Wallet::release(store, &account, &closed, &closed_id)));
-    let before_late = must(drive.run(Wallet::open_holds_created_before(store, UnixMillis(200))));
-    assert_eq!(
-        before_late,
-        vec![PendingHold {
-            hold: early_id.clone(),
+    let key = KeyId(String::from("list-key"));
+    let alpha = AccountId(String::from("a"));
+    let beta = AccountId(String::from("b"));
+    must(store.deposit(&alpha, usd(200)));
+    must(store.deposit(&beta, usd(200)));
+    let hold_at = |account: &AccountId, name: &str, at: u64, amount: u64| {
+        store.set_now(UnixMillis(at));
+        must(drive.run(Wallet::hold(
+            store,
+            account,
+            &RequestId(String::from(name)),
+            &key,
+            None,
+            usd(amount),
+        )))
+    };
+    let released = hold_at(&beta, "released", 50, 10);
+    let settled = hold_at(&alpha, "settled", 100, 10);
+    let middle = hold_at(&alpha, "m", 100, 30);
+    let first = hold_at(&alpha, "a", 100, 20);
+    let third = hold_at(&beta, "a", 100, 40);
+    let edge = hold_at(&alpha, "edge", 150, 10);
+    let _later = hold_at(&alpha, "z", 200, 10);
+    let open_before =
+        |cutoff: u64| must(drive.run(Wallet::open_holds_created_before(store, UnixMillis(cutoff))));
+    assert_eq!(open_before(50), []);
+    let oldest = open_before(51);
+    assert_eq!(oldest.len(), 1);
+    assert_eq!(oldest[0].hold, released);
+    must(drive.run(Wallet::release(
+        store,
+        &beta,
+        &RequestId(String::from("released")),
+        &released,
+    )));
+    must(drive.run(Wallet::settle(
+        store,
+        &alpha,
+        &RequestId(String::from("settled")),
+        &settled,
+        usd(10),
+    )));
+    assert_eq!(open_before(100), []);
+    let row =
+        |account: &AccountId, request: &str, hold: HoldId, amount: u64, at: u64| PendingHold {
+            hold,
             account: account.clone(),
-            request: early.clone(),
+            request: RequestId(String::from(request)),
             key: key.clone(),
-            amount: usd(10),
-            created_at: UnixMillis(100),
-        }]
-    );
-    let all = must(drive.run(Wallet::open_holds_created_before(store, UnixMillis(201))));
-    let requests: Vec<(&str, u64)> = all
-        .iter()
-        .map(|hold| (hold.request.0.as_str(), hold.created_at.0))
-        .collect();
-    assert_eq!(requests, [("aged-early", 100), ("aged-late", 200)]);
+            amount: usd(amount),
+            created_at: UnixMillis(at),
+        };
+    let listed = open_before(150);
     assert_eq!(
-        must(drive.run(Wallet::open_holds_created_before(store, UnixMillis(100)))),
-        []
+        listed,
+        vec![
+            row(&alpha, "a", first, 20, 100),
+            row(&alpha, "m", middle, 30, 100),
+            row(&beta, "a", third, 40, 100),
+        ]
     );
-    must(drive.run(Wallet::settle(store, &account, &early, &early_id, usd(10))));
-    let after_settle = must(drive.run(Wallet::open_holds_created_before(store, UnixMillis(201))));
-    assert_eq!(after_settle.len(), 1);
-    assert_eq!(after_settle[0].request, late);
+    let with_edge = open_before(151);
+    assert_eq!(with_edge.len(), listed.len() + 1);
+    assert_eq!(with_edge[3].hold, edge);
+    assert_eq!(with_edge[3].created_at, UnixMillis(150));
+    finish_open_holds(store, drive, &listed);
+}
+
+fn finish_open_holds<S: WalletContract, D: DriveWallet>(
+    store: &S,
+    drive: &D,
+    listed: &[billing_domain::PendingHold],
+) {
+    let revenue = must(store.funds(Currency::Usd)).revenue;
+    let before = store.entries();
+    must(drive.run(Wallet::release(
+        store,
+        &listed[0].account,
+        &listed[0].request,
+        &listed[0].hold,
+    )));
+    assert_eq!(must(store.funds(Currency::Usd)).revenue, revenue);
+    let after_release = store.entries();
+    assert_eq!(&after_release[..before.len()], before.as_slice());
+    must(drive.run(Wallet::settle(
+        store,
+        &listed[1].account,
+        &listed[1].request,
+        &listed[1].hold,
+        usd(12),
+    )));
+    let after_settle = store.entries();
+    assert_eq!(
+        &after_settle[..after_release.len()],
+        after_release.as_slice()
+    );
+    assert_eq!(must(store.funds(Currency::Usd)).revenue, revenue + 12);
+    let pending = must(drive.run(Wallet::open_holds_created_before(store, UnixMillis(201))));
+    assert_eq!(pending.len(), 3);
+    assert_eq!(pending[0].hold, listed[2].hold);
+    must(drive.run(Wallet::release(
+        store,
+        &pending[0].account,
+        &pending[0].request,
+        &pending[0].hold,
+    )));
+    let still = must(drive.run(Wallet::open_holds_created_before(store, UnixMillis(201))));
+    assert_eq!(still.len(), 2);
+    assert_eq!(still[0].created_at, UnixMillis(150));
+    assert_eq!(still[1].created_at, UnixMillis(200));
     assert_books(store);
 }
 
@@ -809,6 +895,11 @@ fn hold_token_matches_only_its_open_hold<S: WalletContract, D: DriveWallet>(stor
         )),
         Err(WalletError::Rejected(BillingRejection::InsufficientBalance))
     ));
+    assert!(matches!(
+        drive.run(Wallet::release(store, &account, &request, &wrong)),
+        Err(WalletError::Rejected(BillingRejection::HoldNotFound))
+    ));
+    assert_eq!(available(store, drive, &account), 100);
     let id = must(drive.run(Wallet::hold(store, &account, &request, &key, None, usd(40))));
     let other = RequestId(String::from("token-other"));
     let other_id = must(drive.run(Wallet::hold(store, &account, &other, &key, None, usd(10))));
@@ -932,7 +1023,7 @@ fn joined<T>(result: thread::Result<T>) -> T {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_wallet_contract, PollReady};
+    use super::{run_wallet_contract, usd, DriveWallet, PollReady};
     use crate::{ManualClock, MemoryWallet};
     use kernel::model::UnixMillis;
 
@@ -942,5 +1033,44 @@ mod tests {
             || MemoryWallet::new(ManualClock::new(UnixMillis(0))),
             &PollReady,
         );
+    }
+
+    #[test]
+    fn memory_funding_trait_rejects_before_open() {
+        use billing::ports::Funding;
+        use billing_domain::{Credited, FundingError, FundingRejection, Opened};
+        use kernel::model::{AccountId, CreditId, Currency};
+
+        let wallet = MemoryWallet::new(ManualClock::new(UnixMillis(0)));
+        let account = AccountId(String::from("trait"));
+        let empty = PollReady.run(Funding::credit(
+            &wallet,
+            &account,
+            &CreditId(String::new()),
+            usd(0),
+        ));
+        assert_eq!(
+            empty,
+            Err(FundingError::Rejected(FundingRejection::EmptyCreditId))
+        );
+        let zero = PollReady.run(Funding::credit(
+            &wallet,
+            &account,
+            &CreditId(String::from("z")),
+            usd(0),
+        ));
+        assert_eq!(
+            zero,
+            Err(FundingError::Rejected(FundingRejection::ZeroAmount))
+        );
+        let opened = PollReady.run(Funding::open_account(&wallet, &account, Currency::Usd));
+        assert_eq!(opened, Ok(Opened::Created));
+        let applied = PollReady.run(Funding::credit(
+            &wallet,
+            &account,
+            &CreditId(String::from("c")),
+            usd(4),
+        ));
+        assert_eq!(applied, Ok(Credited::Applied));
     }
 }
