@@ -621,6 +621,77 @@ mod tests {
     }
 
     #[test]
+    fn settling_the_whole_hold_and_reaching_the_cap_exactly_are_allowed() {
+        let (account, request, key) = ids();
+        let settled = must(post_settle(&SettleRequest {
+            account: &account,
+            request: &request,
+            amount: money(40),
+            at: UnixMillis(11),
+            balance: snapshot(60, 40),
+            existing: Some(ExistingHold::Open(OpenHold {
+                key: key.clone(),
+                amount: money(40),
+            })),
+        }));
+        assert_eq!(settled.balance, snapshot(60, 0));
+        assert_eq!(settled.entries.len(), 2);
+        assert!(matches!(
+            (
+                &settled.entries[0].account,
+                &settled.entries[1].account,
+                settled.entries[1].amount.minor_units
+            ),
+            (LedgerAccount::Held(_), LedgerAccount::Revenue, 40)
+        ));
+        let cap = KeyCap {
+            since: UnixMillis(0),
+            limit: money(10),
+        };
+        let at_cap = must(post_hold(&hold(
+            (&account, &request, &key),
+            3,
+            Some(snapshot(10, 0)),
+            None,
+            Some(cap),
+            spent(5, 2),
+        )));
+        assert_eq!(at_cap.balance, snapshot(7, 3));
+    }
+
+    #[test]
+    fn a_balance_row_in_another_currency_on_either_side_is_a_mismatch() {
+        let (account, request, key) = ids();
+        let open = OpenHold {
+            key,
+            amount: money(40),
+        };
+        for balance in [
+            WalletSnapshot {
+                available: money(60),
+                held: cny(40),
+            },
+            WalletSnapshot {
+                available: cny(60),
+                held: money(40),
+            },
+        ] {
+            let settled = post_settle(&SettleRequest {
+                account: &account,
+                request: &request,
+                amount: money(25),
+                at: UnixMillis(11),
+                balance,
+                existing: Some(ExistingHold::Open(open.clone())),
+            });
+            assert!(matches!(
+                settled,
+                Err(WalletError::Rejected(BillingRejection::CurrencyMismatch))
+            ));
+        }
+    }
+
+    #[test]
     fn settle_and_release_reject_terminal_states_without_rewriting_the_amount() {
         let (account, request, key) = ids();
         let balance = snapshot(60, 40);

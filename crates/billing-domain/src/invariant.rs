@@ -236,6 +236,86 @@ mod tests {
     }
 
     #[test]
+    fn held_flat_counts_only_this_request_and_names_its_currency() {
+        let account = AccountId(String::from("acct"));
+        let key = KeyId(String::from("key"));
+        let cny_request = RequestId(String::from("cny-req"));
+        let usd_request = RequestId(String::from("usd-req"));
+        let cny_hold = must(post_hold(&HoldRequest {
+            account: &account,
+            request: &cny_request,
+            key: &key,
+            cap: None,
+            amount: money(Currency::Cny, 30),
+            at: UnixMillis(1),
+            balance: Some(WalletSnapshot {
+                available: money(Currency::Cny, 100),
+                held: money(Currency::Cny, 0),
+            }),
+            existing: None,
+            spent: SpendSoFar {
+                settled: money(Currency::Cny, 0),
+                open: money(Currency::Cny, 0),
+            },
+        }));
+        let usd_hold = must(post_hold(&HoldRequest {
+            account: &account,
+            request: &usd_request,
+            key: &key,
+            cap: None,
+            amount: money(Currency::Usd, 40),
+            at: UnixMillis(2),
+            balance: Some(WalletSnapshot {
+                available: money(Currency::Usd, 100),
+                held: money(Currency::Usd, 0),
+            }),
+            existing: None,
+            spent: SpendSoFar {
+                settled: money(Currency::Usd, 0),
+                open: money(Currency::Usd, 0),
+            },
+        }));
+        let usd_release = must(post_release(&ReleaseRequest {
+            account: &account,
+            request: &usd_request,
+            at: UnixMillis(3),
+            balance: usd_hold.balance,
+            existing: Some(ExistingHold::Open(OpenHold {
+                key: key.clone(),
+                amount: money(Currency::Usd, 40),
+            })),
+        }));
+        let mut entries = cny_hold.entries;
+        entries.extend(usd_hold.entries);
+        assert_eq!(
+            request_held_flat(&entries, &account, &cny_request),
+            Err(InvariantViolation::Unbalanced {
+                currency: Currency::Cny,
+                debits: 0,
+                credits: 30,
+            })
+        );
+        assert_eq!(
+            request_held_flat(&entries, &account, &usd_request),
+            Err(InvariantViolation::Unbalanced {
+                currency: Currency::Usd,
+                debits: 0,
+                credits: 40,
+            })
+        );
+        entries.extend(usd_release.entries);
+        assert_eq!(request_held_flat(&entries, &account, &usd_request), Ok(()));
+        assert_eq!(
+            request_held_flat(&entries, &account, &cny_request),
+            Err(InvariantViolation::Unbalanced {
+                currency: Currency::Cny,
+                debits: 0,
+                credits: 30,
+            })
+        );
+    }
+
+    #[test]
     fn release_flattens_held_and_rejections_name_the_break() {
         let account = AccountId(String::from("acct"));
         let request = RequestId(String::from("req"));
