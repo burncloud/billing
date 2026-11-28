@@ -1371,7 +1371,7 @@ mod tests {
                 "hold never waited on the balance row lock"
             );
             if let Err(error) = sqlx::query(
-                "INSERT INTO holds (account, request, hold_key, currency, amount, state) VALUES ($1, $2, 'race-insert-first', 'usd', 10, 'open')",
+                "INSERT INTO holds (account, request, hold_key, currency, amount, state, created_at) VALUES ($1, $2, 'race-insert-first', 'usd', 10, 'open', 0)",
             )
             .bind(first_account)
             .bind(first_request)

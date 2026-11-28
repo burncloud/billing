@@ -7,10 +7,10 @@ use billing::errors::{BillingRejection, WalletError};
 use billing::model::{Direction, Entry, EntryRef, KeyCap, LedgerAccount};
 use billing::ports::Wallet;
 use billing_domain::{
-    check_ledger, request_held_flat, CurrencyFunds, InvariantViolation, StorageFault,
+    check_ledger, deposits_in, request_held_flat, AccountFunds, CurrencyFunds, InvariantViolation,
+    StorageFault,
 };
 use kernel::model::{AccountId, Currency, KeyId, Money, RequestId, UnixMillis};
-use billing_domain::{deposits_in, AccountFunds};
 
 /// 内存和以后的 Postgres 共用的钱包端口，外加测试钩子。
 pub trait WalletContract: Wallet<Error = StorageFault> + Sync {
