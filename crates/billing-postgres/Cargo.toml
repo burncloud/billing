@@ -8,14 +8,14 @@ publish.workspace = true
 description = "BurnCloud 计费的 Postgres 钱包。"
 
 [dependencies]
-billing = { git = "https://github.com/burncloud/next", rev = "65462728d20dd2640afff380cdff2cd8990e0535", version = "=0.4.0" }
-billing-domain = { path = "../billing-domain", version = "=0.3.0" }
-kernel = { git = "https://github.com/burncloud/next", rev = "65462728d20dd2640afff380cdff2cd8990e0535", version = "=0.4.0" }
+billing = { git = "https://github.com/burncloud/next", rev = "7378f99546791c16ee95b6c0dc832526e4b31592", version = "=0.5.0" }
+billing-domain = { path = "../billing-domain", version = "=0.4.0" }
+kernel = { git = "https://github.com/burncloud/next", rev = "7378f99546791c16ee95b6c0dc832526e4b31592", version = "=0.5.0" }
 sqlx = { version = "=0.9.1", default-features = false, features = ["runtime-tokio", "postgres", "migrate"] }
 thiserror = "=2.0.21"
 
 [dev-dependencies]
-billing-memory = { path = "../billing-memory", version = "=0.3.0" }
+billing-memory = { path = "../billing-memory", version = "=0.4.0" }
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "time"] }
 
 [lints]

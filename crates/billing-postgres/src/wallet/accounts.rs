@@ -298,7 +298,7 @@ mod tests {
             .is_err());
             assert!(execute(
                 &pool,
-                "INSERT INTO holds (account, request, hold_key, currency, amount, state, created_at) VALUES ('a', 'r-new', 'k', 'usd', 1, 'open', -1)",
+                "INSERT INTO holds (account, request, hold_key, currency, amount, state, created_at, hold_token) VALUES ('a', 'r-new', 'k', 'usd', 1, 'open', -1, 'legacy')",
             )
             .await
             .is_err());
@@ -318,6 +318,31 @@ mod tests {
                 order,
                 [("b", "r-open", 0), ("b", "r-zero", 0), ("a", "r-open", 500)]
             );
+        });
+    }
+
+    #[test]
+    fn migration_backfills_hold_tokens_for_existing_rows() {
+        let runtime = runtime();
+        block(&runtime, async {
+            let pool = schema_pool(&database_url()).await;
+            let old: Vec<_> = migrations().into_iter().take(5).collect();
+            ok(run_migrations(&pool, old).await);
+            let prior = "INSERT INTO holds (account, request, hold_key, currency, amount, state, created_at) VALUES ('a', 'done', 'k', 'usd', 10, 'settled', 1), ('a', 'open', 'k', 'usd', 10, 'open', 1)";
+            ok(execute(&pool, prior).await);
+            ok(run_migrations(&pool, migrations()).await);
+            let rows = ok(sqlx::query("SELECT hold_token FROM holds")
+                .fetch_all(&pool)
+                .await);
+            let mut tokens = Vec::new();
+            for row in rows {
+                tokens.push(ok(row.try_get::<String, _>("hold_token")));
+            }
+            assert_eq!(tokens.len(), 2);
+            assert_ne!(tokens[0], tokens[1]);
+            assert!(!tokens[0].is_empty() && !tokens[1].is_empty());
+            let blank = "INSERT INTO holds (account, request, hold_key, currency, amount, state, created_at, hold_token) VALUES ('a', 'new', 'k', 'usd', 1, 'open', 0, '')";
+            assert!(execute(&pool, blank).await.is_err());
         });
     }
 
@@ -760,9 +785,9 @@ mod tests {
                 late.hold(&account, &fresh, &key, None, usd(3)).await,
                 Err(WalletError::Storage(PostgresError::ClockOutOfRange))
             ));
-            ok(wallet.hold(&account, &held, &key, None, usd(4)).await);
+            let held_id = ok(wallet.hold(&account, &held, &key, None, usd(4)).await);
             assert!(matches!(
-                late.release(&account, &held).await,
+                late.release(&account, &held, &held_id).await,
                 Err(WalletError::Storage(PostgresError::ClockOutOfRange))
             ));
             assert_eq!(ok(wallet.held(&account, &held).await), usd(4));
