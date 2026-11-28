@@ -1,5 +1,5 @@
 use billing::errors::{BillingRejection, WalletError};
-use billing::model::{Direction, Entry, KeyCap, LedgerAccount};
+use billing::model::{Direction, Entry, EntryRef, KeyCap, LedgerAccount};
 use kernel::model::{AccountId, Currency, KeyId, Money, RequestId, UnixMillis};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,7 +107,7 @@ pub fn post_hold(request: &HoldRequest<'_>) -> Result<Posted, WalletError<Storag
     let mut entries = Vec::new();
     push_pair(
         &mut entries,
-        request.request,
+        &EntryRef::Request(request.request.clone()),
         Some(request.key.clone()),
         request.amount,
         request.at,
@@ -157,7 +157,7 @@ pub fn post_settle(request: &SettleRequest<'_>) -> Result<Posted, WalletError<St
     let key = Some(open.key.clone());
     push_pair(
         &mut entries,
-        request.request,
+        &EntryRef::Request(request.request.clone()),
         key.clone(),
         money(currency, request.amount.minor_units),
         request.at,
@@ -166,7 +166,7 @@ pub fn post_settle(request: &SettleRequest<'_>) -> Result<Posted, WalletError<St
     );
     push_pair(
         &mut entries,
-        request.request,
+        &EntryRef::Request(request.request.clone()),
         key,
         money(currency, remainder),
         request.at,
@@ -205,7 +205,7 @@ pub fn post_release(request: &ReleaseRequest<'_>) -> Result<Posted, WalletError<
     let mut entries = Vec::new();
     push_pair(
         &mut entries,
-        request.request,
+        &EntryRef::Request(request.request.clone()),
         Some(open.key.clone()),
         open.amount,
         request.at,
@@ -262,9 +262,9 @@ fn snapshot_currency(
     Ok(amount.currency)
 }
 
-fn push_pair(
+pub(crate) fn push_pair(
     entries: &mut Vec<Entry>,
-    request: &RequestId,
+    reference: &EntryRef,
     key: Option<KeyId>,
     amount: Money,
     at: UnixMillis,
@@ -275,7 +275,7 @@ fn push_pair(
         return;
     }
     entries.push(Entry {
-        request: request.clone(),
+        reference: reference.clone(),
         account: debit,
         key: key.clone(),
         direction: Direction::Debit,
@@ -283,7 +283,7 @@ fn push_pair(
         at,
     });
     entries.push(Entry {
-        request: request.clone(),
+        reference: reference.clone(),
         account: credit,
         key,
         direction: Direction::Credit,

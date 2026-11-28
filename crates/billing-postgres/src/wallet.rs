@@ -1,5 +1,5 @@
 use billing::errors::{BillingRejection, WalletError};
-use billing::model::{Direction, Entry, KeyCap, LedgerAccount};
+use billing::model::{Direction, Entry, EntryRef, KeyCap, LedgerAccount};
 use billing::ports::Wallet;
 use billing_domain::{
     post_hold, post_release, post_settle, ExistingHold, HoldRequest, OpenHold, ReleaseRequest,
@@ -12,6 +12,8 @@ use sqlx::Row;
 use sqlx::SqlSafeStr;
 
 use crate::PostgresError;
+
+mod accounts;
 
 type Tx<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
 
@@ -33,27 +35,59 @@ impl<C> PostgresWallet<C> {
     ///
     /// 迁移执行失败时返回 `PostgresError::Migrate`。
     pub async fn migrate(pool: &sqlx::PgPool) -> Result<(), PostgresError> {
-        Migrator::with_migrations(vec![
-            Migration::new(
-                1,
-                "wallet".into(),
-                MigrationType::Simple,
-                include_str!("../migrations/0001_wallet.sql").into_sql_str(),
-                false,
-            ),
-            Migration::new(
-                2,
-                "model_prices".into(),
-                MigrationType::Simple,
-                include_str!("../migrations/0002_model_prices.sql").into_sql_str(),
-                false,
-            ),
-        ])
+        run_migrations(pool, migrations()).await
+    }
+}
+
+fn migrations() -> Vec<Migration> {
+    vec![
+        Migration::new(
+            1,
+            "wallet".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0001_wallet.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            2,
+            "model_prices".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0002_model_prices.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            3,
+            "hold_created_at".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0003_hold_created_at.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            4,
+            "credits".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0004_credits.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            5,
+            "funding_entries".into(),
+            MigrationType::Simple,
+            include_str!("../migrations/0005_funding_entries.sql").into_sql_str(),
+            false,
+        ),
+    ]
+}
+
+async fn run_migrations(
+    pool: &sqlx::PgPool,
+    migrations: Vec<Migration>,
+) -> Result<(), PostgresError> {
+    Migrator::with_migrations(migrations)
         .run(pool)
         .await
         .map_err(|error| PostgresError::Migrate(Box::new(error)))?;
-        Ok(())
-    }
+    Ok(())
 }
 
 impl<C: Clock + Sync> Wallet for PostgresWallet<C> {
@@ -204,8 +238,10 @@ async fn hold_in(
         spent,
     }))?;
     write_balance(tx, account, posted.balance).await?;
-    insert_open_hold(tx, account, request, key, amount).await?;
-    insert_entries(tx, &posted.entries).await?;
+    insert_open_hold(tx, now, account, request, key, amount).await?;
+    insert_entries(tx, &posted.entries)
+        .await
+        .map_err(WalletError::Storage)?;
     Ok(())
 }
 
@@ -237,7 +273,9 @@ async fn settle_in(
     }))?;
     write_balance(tx, account, posted.balance).await?;
     set_hold_state(tx, account, request, "settled").await?;
-    insert_entries(tx, &posted.entries).await?;
+    insert_entries(tx, &posted.entries)
+        .await
+        .map_err(WalletError::Storage)?;
     Ok(())
 }
 
@@ -270,7 +308,9 @@ async fn release_in(
     }))?;
     write_balance(tx, account, posted.balance).await?;
     set_hold_state(tx, account, request, "released").await?;
-    insert_entries(tx, &posted.entries).await?;
+    insert_entries(tx, &posted.entries)
+        .await
+        .map_err(WalletError::Storage)?;
     Ok(())
 }
 
@@ -433,19 +473,21 @@ async fn write_balance(
 
 async fn insert_open_hold(
     tx: &mut Tx<'_>,
+    now: UnixMillis,
     account: &AccountId,
     request: &RequestId,
     key: &KeyId,
     amount: Money,
 ) -> Result<(), WalletError<PostgresError>> {
     let result = sqlx::query(
-        "INSERT INTO holds (account, request, hold_key, currency, amount, state) VALUES ($1, $2, $3, $4, $5, 'open')",
+        "INSERT INTO holds (account, request, hold_key, currency, amount, state, created_at) VALUES ($1, $2, $3, $4, $5, 'open', $6)",
     )
     .bind(account.0.as_str())
     .bind(request.0.as_str())
     .bind(key.0.as_str())
     .bind(currency_code(amount.currency))
     .bind(to_i64(amount.minor_units)?)
+    .bind(clock_i64(now)?)
     .execute(&mut **tx)
     .await;
     match result {
@@ -471,36 +513,46 @@ async fn set_hold_state(
     Ok(())
 }
 
-async fn insert_entries(
+pub(super) async fn insert_entries(
     tx: &mut Tx<'_>,
     entries: &[Entry],
-) -> Result<(), WalletError<PostgresError>> {
+) -> Result<(), PostgresError> {
     for entry in entries {
         let (kind, account_id) = match &entry.account {
             LedgerAccount::Available(id) => ("available", Some(id.0.as_str())),
             LedgerAccount::Held(id) => ("held", Some(id.0.as_str())),
             LedgerAccount::Revenue => ("revenue", None),
+            LedgerAccount::Funding => ("funding", None),
+        };
+        let (reference_kind, reference) = match &entry.reference {
+            EntryRef::Request(id) => ("request", id.0.as_str()),
+            EntryRef::Credit(id) => ("credit", id.0.as_str()),
         };
         let direction = match entry.direction {
             Direction::Debit => "debit",
             Direction::Credit => "credit",
         };
         sqlx::query(
-            "INSERT INTO entries (request, account_kind, account_id, entry_key, direction, currency, amount, at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO entries (reference, reference_kind, account_kind, account_id, entry_key, direction, currency, amount, at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
-        .bind(entry.request.0.as_str())
+        .bind(reference)
+        .bind(reference_kind)
         .bind(kind)
         .bind(account_id)
         .bind(entry.key.as_ref().map(|key| key.0.as_str()))
         .bind(direction)
         .bind(currency_code(entry.amount.currency))
-        .bind(to_i64(entry.amount.minor_units)?)
-        .bind(to_i64(entry.at.0)?)
+        .bind(i64::try_from(entry.amount.minor_units).map_err(|_| PostgresError::AmountOutOfRange)?)
+        .bind(i64::try_from(entry.at.0).map_err(|_| PostgresError::ClockOutOfRange)?)
         .execute(&mut **tx)
         .await
-        .map_err(storage)?;
+        .map_err(database)?;
     }
     Ok(())
+}
+
+pub(super) fn database(error: sqlx::Error) -> PostgresError {
+    PostgresError::Database(Box::new(error))
 }
 
 fn hold_from_row(row: &sqlx::postgres::PgRow) -> Result<ExistingHold, WalletError<PostgresError>> {
@@ -530,6 +582,7 @@ fn entry_from_row(row: &sqlx::postgres::PgRow) -> Result<Entry, WalletError<Post
         ("available", Some(id)) => LedgerAccount::Available(AccountId(id)),
         ("held", Some(id)) => LedgerAccount::Held(AccountId(id)),
         ("revenue", None) => LedgerAccount::Revenue,
+        ("funding", None) => LedgerAccount::Funding,
         _ => return Err(WalletError::Storage(PostgresError::UnknownEntry)),
     };
     let direction = match row
@@ -547,8 +600,15 @@ fn entry_from_row(row: &sqlx::postgres::PgRow) -> Result<Entry, WalletError<Post
     let at: i64 = row.try_get("at").map_err(storage)?;
     let at =
         u64::try_from(at).map_err(|_| WalletError::Storage(PostgresError::AmountOutOfRange))?;
+    let reference: String = row.try_get("reference").map_err(storage)?;
+    let reference_kind: String = row.try_get("reference_kind").map_err(storage)?;
+    let reference = match reference_kind.as_str() {
+        "request" => EntryRef::Request(RequestId(reference)),
+        "credit" => EntryRef::Credit(kernel::model::CreditId(reference)),
+        _ => return Err(WalletError::Storage(PostgresError::UnknownEntry)),
+    };
     Ok(Entry {
-        request: RequestId(row.try_get::<String, _>("request").map_err(storage)?),
+        reference,
         account,
         key: entry_key.map(KeyId),
         direction,
@@ -590,6 +650,10 @@ fn minor_from_row(
 
 fn to_i64(value: u64) -> Result<i64, WalletError<PostgresError>> {
     i64::try_from(value).map_err(|_| rejected(BillingRejection::Overflow))
+}
+
+fn clock_i64(now: UnixMillis) -> Result<i64, WalletError<PostgresError>> {
+    i64::try_from(now.0).map_err(|_| WalletError::Storage(PostgresError::ClockOutOfRange))
 }
 
 fn storage(error: sqlx::Error) -> WalletError<PostgresError> {
@@ -643,7 +707,9 @@ mod tests {
 
     use billing::errors::{BillingRejection, WalletError};
     use billing::ports::Wallet;
-    use billing_domain::StorageFault;
+    use billing_domain::{
+        credit_entries, CreditId, Credited, FundingError, Opened, PendingHold, StorageFault,
+    };
     use billing_memory::{run_wallet_contract, DriveWallet, WalletContract};
     use kernel::model::{AccountId, Currency, KeyId, Money, RequestId, UnixMillis};
     use kernel::ports::Clock;
@@ -655,6 +721,8 @@ mod tests {
         currency_code, entry_from_row, finish, minor_from_row, rejected, storage, to_i64,
         PostgresError, PostgresWallet,
     };
+
+    static SEEDS: AtomicU64 = AtomicU64::new(0);
 
     struct TestClock {
         now: AtomicU64,
@@ -685,13 +753,13 @@ mod tests {
             amount: Money,
         ) -> Result<(), WalletError<PostgresError>> {
             let mut tx = self.pool.begin().await.map_err(storage)?;
-            let result = deposit_in(&mut tx, account, amount).await;
+            let result = deposit_in(&mut tx, self.clock.now(), account, amount).await;
             finish(tx, result).await
         }
 
         async fn entries(&self) -> Result<Vec<billing::model::Entry>, WalletError<PostgresError>> {
             let rows = sqlx::query(
-                "SELECT request, account_kind, account_id, entry_key, direction, currency, amount, at FROM entries ORDER BY id",
+                "SELECT reference, reference_kind, account_kind, account_id, entry_key, direction, currency, amount, at FROM entries ORDER BY id",
             )
             .fetch_all(&self.pool)
             .await
@@ -707,24 +775,19 @@ mod tests {
             &self,
             currency: Currency,
         ) -> Result<billing_domain::CurrencyFunds, WalletError<PostgresError>> {
-            let balances =
-                sqlx::query("SELECT available, held, deposited FROM balances WHERE currency = $1")
-                    .bind(currency_code(currency))
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(storage)?;
+            let balances = sqlx::query("SELECT available, held FROM balances WHERE currency = $1")
+                .bind(currency_code(currency))
+                .fetch_all(&self.pool)
+                .await
+                .map_err(storage)?;
             let mut available = 0_u64;
             let mut held = 0_u64;
-            let mut deposits = 0_u64;
             for row in balances {
                 available = available
                     .checked_add(minor_from_row(&row, "available")?)
                     .ok_or(rejected(BillingRejection::Overflow))?;
                 held = held
                     .checked_add(minor_from_row(&row, "held")?)
-                    .ok_or(rejected(BillingRejection::Overflow))?;
-                deposits = deposits
-                    .checked_add(minor_from_row(&row, "deposited")?)
                     .ok_or(rejected(BillingRejection::Overflow))?;
             }
             let revenue_rows = sqlx::query(
@@ -749,14 +812,36 @@ mod tests {
                 currency,
                 available,
                 held,
-                deposits,
                 revenue,
             })
+        }
+
+        async fn account_funds(
+            &self,
+        ) -> Result<Vec<billing_domain::AccountFunds>, WalletError<PostgresError>> {
+            let rows = sqlx::query(
+                "SELECT account, currency, available, held FROM balances ORDER BY account COLLATE \"C\", currency",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)?;
+            let mut accounts = Vec::new();
+            for row in rows {
+                let currency: String = row.try_get("currency").map_err(storage)?;
+                accounts.push(billing_domain::AccountFunds {
+                    account: AccountId(row.try_get("account").map_err(storage)?),
+                    currency: super::parse_currency(&currency).map_err(WalletError::Storage)?,
+                    available: minor_from_row(&row, "available")?,
+                    held: minor_from_row(&row, "held")?,
+                });
+            }
+            Ok(accounts)
         }
     }
 
     async fn deposit_in(
         tx: &mut super::Tx<'_>,
+        now: UnixMillis,
         account: &AccountId,
         amount: Money,
     ) -> Result<(), WalletError<PostgresError>> {
@@ -795,6 +880,10 @@ mod tests {
         .execute(&mut **tx)
         .await
         .map_err(storage)?;
+        let seed = CreditId(format!("seed-{}", SEEDS.fetch_add(1, Ordering::Relaxed)));
+        super::insert_entries(tx, &credit_entries(account, &seed, amount, now))
+            .await
+            .map_err(WalletError::Storage)?;
         Ok(())
     }
 
@@ -893,8 +982,50 @@ mod tests {
             adapt(self.call(self.wallet.funds(currency)))
         }
 
+        fn account_funds(&self) -> Vec<billing_domain::AccountFunds> {
+            match self.call(self.wallet.account_funds()) {
+                Ok(accounts) => accounts,
+                Err(error) => panic!("{error:?}"),
+            }
+        }
+
         fn set_now(&self, now: UnixMillis) {
             self.wallet.clock.set(now);
+        }
+
+        fn open_account(
+            &self,
+            account: &AccountId,
+            currency: Currency,
+        ) -> Result<Opened, FundingError<StorageFault>> {
+            match self.call(self.wallet.open_account(account, currency)) {
+                Ok(opened) => Ok(opened),
+                Err(FundingError::Rejected(reason)) => Err(FundingError::Rejected(reason)),
+                Err(FundingError::Storage(error)) => panic!("{error:?}"),
+            }
+        }
+
+        fn credit(
+            &self,
+            account: &AccountId,
+            credit: &CreditId,
+            amount: Money,
+        ) -> Result<Credited, FundingError<StorageFault>> {
+            match self.call(self.wallet.credit(account, credit, amount)) {
+                Ok(credited) => Ok(credited),
+                Err(FundingError::Rejected(reason)) => Err(FundingError::Rejected(reason)),
+                Err(FundingError::Storage(error)) => panic!("{error:?}"),
+            }
+        }
+
+        fn open_holds_created_before(
+            &self,
+            cutoff: UnixMillis,
+        ) -> Result<Vec<PendingHold>, WalletError<StorageFault>> {
+            adapt(
+                self.call(self.wallet.open_holds_created_before(cutoff))
+                    .map_err(WalletError::Storage),
+            )
         }
     }
 
@@ -962,6 +1093,115 @@ mod tests {
 
     fn drive_open(url: &str, handle: &tokio::runtime::Handle) -> PgContract {
         handle.block_on(open_store(url, handle.clone()))
+    }
+
+    fn books(store: &PgContract) -> Result<(), billing_domain::InvariantViolation> {
+        let funds = match store.funds(Currency::Usd) {
+            Ok(funds) => funds,
+            Err(error) => panic!("{error:?}"),
+        };
+        billing_domain::check_ledger(&store.entries(), &[funds], &store.account_funds())
+    }
+
+    fn tamper(store: &PgContract, sql: &'static str) {
+        if let Err(error) = store.call(sqlx::query(sql).execute(&store.wallet.pool)) {
+            panic!("{error:?}");
+        }
+    }
+
+    #[test]
+    fn the_ledger_check_catches_a_tampered_wallet() {
+        let url = database_url();
+        let drive = TokioDrive::start();
+        let store = drive_open(&url, drive.runtime.handle());
+        let first = AccountId(String::from("t1"));
+        let second = AccountId(String::from("t2"));
+        let key = KeyId(String::from("tamper-key"));
+        let usd = |minor_units| Money {
+            currency: Currency::Usd,
+            minor_units,
+        };
+        for (account, id, amount) in [(&first, "c-1", 100), (&second, "c-2", 50)] {
+            match store.call(store.wallet.open_account(account, Currency::Usd)) {
+                Ok(_) => {}
+                Err(error) => panic!("{error:?}"),
+            }
+            match store.call(
+                store
+                    .wallet
+                    .credit(account, &CreditId(String::from(id)), usd(amount)),
+            ) {
+                Ok(Credited::Applied) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        let request = RequestId(String::from("tamper-req"));
+        assert!(store
+            .call(store.wallet.hold(&first, &request, &key, None, usd(30)))
+            .is_ok());
+        assert_eq!(books(&store), Ok(()));
+
+        tamper(
+            &store,
+            "UPDATE balances SET available = available - 10, held = held + 10 WHERE account = 't1'",
+        );
+        assert_eq!(
+            books(&store),
+            Err(billing_domain::InvariantViolation::AvailableMismatch {
+                account: first.clone(),
+                currency: Currency::Usd,
+            })
+        );
+        tamper(
+            &store,
+            "UPDATE balances SET available = available + 10, held = held - 10 WHERE account = 't1'",
+        );
+        assert_eq!(books(&store), Ok(()));
+
+        tamper(
+            &store,
+            "UPDATE balances SET held = held + 1, available = available - 1 WHERE account = 't2'",
+        );
+        assert_eq!(
+            books(&store),
+            Err(billing_domain::InvariantViolation::AvailableMismatch {
+                account: second.clone(),
+                currency: Currency::Usd,
+            })
+        );
+        tamper(
+            &store,
+            "UPDATE balances SET held = held - 1, available = available + 1 WHERE account = 't2'",
+        );
+
+        tamper(
+            &store,
+            "UPDATE balances SET available = available + 1 WHERE account = 't2'",
+        );
+        assert!(matches!(
+            books(&store),
+            Err(billing_domain::InvariantViolation::NotConserved {
+                currency: Currency::Usd
+            })
+        ));
+        tamper(
+            &store,
+            "UPDATE balances SET available = available - 1 WHERE account = 't2'",
+        );
+        assert_eq!(books(&store), Ok(()));
+
+        tamper(
+            &store,
+            "DELETE FROM entries WHERE reference = 'c-2' AND account_kind = 'funding'",
+        );
+        assert_eq!(
+            books(&store),
+            Err(billing_domain::InvariantViolation::Unbalanced {
+                currency: Currency::Usd,
+                debits: 130,
+                credits: 180,
+            })
+        );
     }
 
     #[test]
@@ -1131,7 +1371,7 @@ mod tests {
                 "hold never waited on the balance row lock"
             );
             if let Err(error) = sqlx::query(
-                "INSERT INTO holds (account, request, hold_key, currency, amount, state) VALUES ($1, $2, 'race-insert-first', 'usd', 10, 'open')",
+                "INSERT INTO holds (account, request, hold_key, currency, amount, state, created_at) VALUES ($1, $2, 'race-insert-first', 'usd', 10, 'open', 0)",
             )
             .bind(first_account)
             .bind(first_request)

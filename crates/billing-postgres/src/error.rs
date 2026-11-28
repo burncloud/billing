@@ -9,6 +9,8 @@ pub enum PostgresError {
     Database(#[source] Box<sqlx::Error>),
     #[error("迁移失败")]
     Migrate(#[source] Box<sqlx::migrate::MigrateError>),
+    #[error("时钟超出数据库能存的范围")]
+    ClockOutOfRange,
     #[error("金额超出已校验范围")]
     AmountOutOfRange,
     #[error("币种无法识别")]

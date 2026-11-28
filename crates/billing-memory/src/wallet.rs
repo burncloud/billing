@@ -7,8 +7,10 @@ use billing::errors::{BillingRejection, WalletError};
 use billing::model::{Direction, Entry, KeyCap, LedgerAccount};
 use billing::ports::Wallet;
 use billing_domain::{
-    post_hold, post_release, post_settle, CurrencyFunds, ExistingHold, HoldRequest, OpenHold,
-    ReleaseRequest, SettleRequest, SpendSoFar, StorageFault, WalletSnapshot,
+    check_funding_currency, credit_entries, post_credit, post_hold, post_release, post_settle,
+    AccountFunds, CreditId, CreditPosting, CreditRequest, Credited, CurrencyFunds, ExistingHold,
+    FundingError, FundingRow, HoldRequest, OpenHold, Opened, PendingHold, ReleaseRequest,
+    SettleRequest, SpendSoFar, StorageFault, WalletSnapshot,
 };
 use kernel::model::{AccountId, Currency, KeyId, Money, RequestId, UnixMillis};
 use kernel::ports::Clock;
@@ -23,6 +25,8 @@ struct State {
     balances: HashMap<BalanceKey, WalletSnapshot>,
     deposits: HashMap<BalanceKey, u64>,
     holds: HashMap<HoldKey, ExistingHold>,
+    hold_created: HashMap<HoldKey, UnixMillis>,
+    credits: HashMap<(AccountId, CreditId), Money>,
     entries: Vec<Entry>,
 }
 
@@ -63,6 +67,8 @@ impl<C> MemoryWallet<C> {
                 balances: HashMap::new(),
                 deposits: HashMap::new(),
                 holds: HashMap::new(),
+                hold_created: HashMap::new(),
+                credits: HashMap::new(),
                 entries: Vec::new(),
             }),
         }
@@ -109,6 +115,11 @@ impl WalletContract for MemoryWallet<ManualClock> {
             .checked_add(amount.minor_units)
             .ok_or(WalletError::Rejected(BillingRejection::Overflow))?;
         state.deposits.insert(key.clone(), deposited);
+        let seed = CreditId(format!("seed-{}", state.entries.len()));
+        let at = self.clock.now();
+        state
+            .entries
+            .extend(credit_entries(account, &seed, amount, at));
         state.balances.insert(
             key,
             WalletSnapshot {
@@ -129,11 +140,125 @@ impl WalletContract for MemoryWallet<ManualClock> {
         self.lock().entries.clone()
     }
 
+    fn open_account(
+        &self,
+        account: &AccountId,
+        currency: Currency,
+    ) -> Result<Opened, FundingError<StorageFault>> {
+        check_funding_currency(currency).map_err(FundingError::Rejected)?;
+        let mut state = self.lock();
+        let key = (account.clone(), currency);
+        if state.balances.contains_key(&key) {
+            return Ok(Opened::AlreadyOpen);
+        }
+        state.balances.insert(
+            key,
+            WalletSnapshot {
+                available: Money {
+                    currency,
+                    minor_units: 0,
+                },
+                held: Money {
+                    currency,
+                    minor_units: 0,
+                },
+            },
+        );
+        Ok(Opened::Created)
+    }
+
+    fn credit(
+        &self,
+        account: &AccountId,
+        credit: &CreditId,
+        amount: Money,
+    ) -> Result<Credited, FundingError<StorageFault>> {
+        let mut state = self.lock();
+        let balance_key = (account.clone(), amount.currency);
+        let credit_key = (account.clone(), credit.clone());
+        let row = state.balances.get(&balance_key).map(|snapshot| FundingRow {
+            available: snapshot.available.minor_units,
+            deposited: state
+                .deposits
+                .get(&balance_key)
+                .copied()
+                .unwrap_or_default(),
+        });
+        let existing = state.credits.get(&credit_key).copied();
+        let applied = match post_credit(&CreditRequest {
+            account,
+            credit,
+            amount,
+            row,
+            existing,
+            at: self.clock.now(),
+        }) {
+            Ok(CreditPosting::AlreadyApplied) => return Ok(Credited::AlreadyApplied),
+            Ok(CreditPosting::Apply(applied)) => applied,
+            Err(reason) => return Err(FundingError::Rejected(reason)),
+        };
+        let funded = applied.row;
+        let held = state
+            .balances
+            .get(&balance_key)
+            .map_or(0, |snapshot| snapshot.held.minor_units);
+        state.balances.insert(
+            balance_key.clone(),
+            WalletSnapshot {
+                available: Money {
+                    currency: amount.currency,
+                    minor_units: funded.available,
+                },
+                held: Money {
+                    currency: amount.currency,
+                    minor_units: held,
+                },
+            },
+        );
+        state.deposits.insert(balance_key, funded.deposited);
+        state.credits.insert(credit_key, amount);
+        state.entries.extend(applied.entries);
+        Ok(Credited::Applied)
+    }
+
+    fn open_holds_created_before(
+        &self,
+        cutoff: UnixMillis,
+    ) -> Result<Vec<PendingHold>, WalletError<StorageFault>> {
+        let state = self.lock();
+        let mut pending = Vec::new();
+        for ((account, request), hold) in &state.holds {
+            let ExistingHold::Open(open) = hold else {
+                continue;
+            };
+            let Some(created_at) = state.hold_created.get(&(account.clone(), request.clone()))
+            else {
+                continue;
+            };
+            if *created_at < cutoff {
+                pending.push(PendingHold {
+                    account: account.clone(),
+                    request: request.clone(),
+                    key: open.key.clone(),
+                    amount: open.amount,
+                    created_at: *created_at,
+                });
+            }
+        }
+        pending.sort_by(|left, right| {
+            (left.created_at, &left.account.0, &left.request.0).cmp(&(
+                right.created_at,
+                &right.account.0,
+                &right.request.0,
+            ))
+        });
+        Ok(pending)
+    }
+
     fn funds(&self, currency: Currency) -> Result<CurrencyFunds, WalletError<StorageFault>> {
         let state = self.lock();
         let mut available = 0_u64;
         let mut held = 0_u64;
-        let mut deposits = 0_u64;
         for ((_, row_currency), snapshot) in &state.balances {
             if *row_currency != currency {
                 continue;
@@ -145,22 +270,29 @@ impl WalletContract for MemoryWallet<ManualClock> {
                 .checked_add(snapshot.held.minor_units)
                 .ok_or(WalletError::Rejected(BillingRejection::Overflow))?;
         }
-        for ((_, row_currency), amount) in &state.deposits {
-            if *row_currency != currency {
-                continue;
-            }
-            deposits = deposits
-                .checked_add(*amount)
-                .ok_or(WalletError::Rejected(BillingRejection::Overflow))?;
-        }
         let revenue = revenue_of(&state.entries, currency)?;
         Ok(CurrencyFunds {
             currency,
             available,
             held,
-            deposits,
             revenue,
         })
+    }
+
+    fn account_funds(&self) -> Vec<AccountFunds> {
+        let state = self.lock();
+        let mut rows: Vec<AccountFunds> = state
+            .balances
+            .iter()
+            .map(|((account, currency), snapshot)| AccountFunds {
+                account: account.clone(),
+                currency: *currency,
+                available: snapshot.available.minor_units,
+                held: snapshot.held.minor_units,
+            })
+            .collect();
+        rows.sort_by_key(|row| (row.account.0.clone(), matches!(row.currency, Currency::Cny)));
+        rows
     }
 }
 
@@ -204,6 +336,9 @@ impl<C: Clock + Sync> MemoryWallet<C> {
                 amount,
             }),
         );
+        state
+            .hold_created
+            .insert((account.clone(), request.clone()), now);
         state.entries.extend(posted.entries);
         Ok(())
     }
