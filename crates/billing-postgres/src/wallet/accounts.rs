@@ -1,12 +1,12 @@
 use billing_domain::{
-    check_funding_currency, post_credit, CreditId, CreditPosting, Credited, FundingError,
+    check_funding_currency, post_credit, CreditPosting, CreditRequest, Credited, FundingError,
     FundingRejection, FundingRow, Opened, PendingHold,
 };
-use kernel::model::{AccountId, Currency, KeyId, Money, RequestId, UnixMillis};
+use kernel::model::{AccountId, CreditId, Currency, KeyId, Money, RequestId, UnixMillis};
 use kernel::ports::Clock;
 use sqlx::Row;
 
-use super::{currency_code, money, parse_currency, PostgresWallet, Tx};
+use super::{currency_code, database, insert_entries, money, parse_currency, PostgresWallet, Tx};
 use crate::PostgresError;
 
 impl<C: Clock + Sync> PostgresWallet<C> {
@@ -128,11 +128,19 @@ async fn credit_in(
         }
         None => None,
     };
-    let funded = match post_credit(credit, amount, funding, existing) {
+    let applied = match post_credit(&CreditRequest {
+        account,
+        credit,
+        amount,
+        row: funding,
+        existing,
+        at: now,
+    }) {
         Ok(CreditPosting::AlreadyApplied) => return Ok(Credited::AlreadyApplied),
-        Ok(CreditPosting::Apply(funded)) => funded,
+        Ok(CreditPosting::Apply(applied)) => applied,
         Err(reason) => return Err(FundingError::Rejected(reason)),
     };
+    let funded = applied.row;
     sqlx::query(
         "UPDATE balances SET available = $3, deposited = $4 WHERE account = $1 AND currency = $2",
     )
@@ -157,6 +165,9 @@ async fn credit_in(
     .execute(&mut **tx)
     .await
     .map_err(credit_storage)?;
+    insert_entries(tx, &applied.entries)
+        .await
+        .map_err(FundingError::Storage)?;
     Ok(Credited::Applied)
 }
 
@@ -167,10 +178,6 @@ fn unsigned(row: &sqlx::postgres::PgRow, name: &str) -> Result<u64, PostgresErro
 
 fn signed(value: u64) -> Result<i64, FundingError<PostgresError>> {
     i64::try_from(value).map_err(|_| FundingError::Rejected(FundingRejection::Overflow))
-}
-
-fn database(error: sqlx::Error) -> PostgresError {
-    PostgresError::Database(Box::new(error))
 }
 
 fn credit_storage(error: sqlx::Error) -> FundingError<PostgresError> {
@@ -194,6 +201,8 @@ mod tests {
     use super::credit_in;
     use crate::testdb::{database_url, schema_pool};
     use crate::{PostgresError, PostgresWallet};
+
+    type BackfilledEntry = (String, String, String, Option<String>, String, i64, i64);
 
     fn runtime() -> tokio::runtime::Runtime {
         match tokio::runtime::Builder::new_multi_thread()
@@ -424,7 +433,225 @@ mod tests {
             let available: i64 = ok(row.try_get("available"));
             let deposited: i64 = ok(row.try_get("deposited"));
             assert_eq!((available, deposited), (0, 0));
+            assert_eq!(count_rows(&wallet.pool, "entries").await, 0);
         });
+    }
+
+    #[test]
+    fn a_failed_entry_insert_rolls_back_the_credit() {
+        let runtime = runtime();
+        block(&runtime, async {
+            let wallet = wallet(0).await;
+            let account = AccountId(String::from("no-entry"));
+            ok(wallet.open_account(&account, Currency::Usd).await);
+            ok(execute(
+                &wallet.pool,
+                "ALTER TABLE entries ADD CONSTRAINT entries_reject_blocked CHECK (reference <> 'blocked')",
+            )
+            .await);
+            assert!(matches!(
+                wallet
+                    .credit(&account, &CreditId(String::from("blocked")), usd(9))
+                    .await,
+                Err(FundingError::Storage(PostgresError::Database(_)))
+            ));
+            let row = ok(sqlx::query(
+                "SELECT available, deposited FROM balances WHERE account = 'no-entry'",
+            )
+            .fetch_one(&wallet.pool)
+            .await);
+            let available: i64 = ok(row.try_get("available"));
+            let deposited: i64 = ok(row.try_get("deposited"));
+            assert_eq!((available, deposited), (0, 0));
+            assert_eq!(count_rows(&wallet.pool, "credits").await, 0);
+            assert_eq!(count_rows(&wallet.pool, "entries").await, 0);
+            assert!(matches!(
+                wallet
+                    .credit(&account, &CreditId(String::from("fine")), usd(9))
+                    .await,
+                Ok(Credited::Applied)
+            ));
+            assert_eq!(count_rows(&wallet.pool, "credits").await, 1);
+            assert_eq!(count_rows(&wallet.pool, "entries").await, 2);
+        });
+    }
+
+    #[test]
+    fn a_repeated_credit_never_adds_entries() {
+        let runtime = runtime();
+        block(&runtime, async {
+            let wallet = wallet(11).await;
+            let account = AccountId(String::from("once"));
+            ok(wallet.open_account(&account, Currency::Usd).await);
+            let id = CreditId(String::from("c-once"));
+            for _ in 0..3 {
+                ok(wallet.credit(&account, &id, usd(8)).await);
+            }
+            assert!(matches!(
+                wallet.credit(&account, &id, usd(9)).await,
+                Err(FundingError::Rejected(FundingRejection::ConflictingCredit))
+            ));
+            assert_eq!(count_rows(&wallet.pool, "credits").await, 1);
+            let rows = ok(sqlx::query(
+                "SELECT reference, reference_kind, account_kind, account_id, entry_key, direction, currency, amount, at FROM entries ORDER BY id",
+            )
+            .fetch_all(&wallet.pool)
+            .await);
+            let seen: Vec<(String, String, Option<String>, String, i64, i64)> = rows
+                .iter()
+                .map(|row| {
+                    (
+                        ok(row.try_get("reference_kind")),
+                        ok(row.try_get("account_kind")),
+                        ok(row.try_get("account_id")),
+                        ok(row.try_get("direction")),
+                        ok(row.try_get("amount")),
+                        ok(row.try_get("at")),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                seen,
+                [
+                    (
+                        String::from("credit"),
+                        String::from("funding"),
+                        None,
+                        String::from("debit"),
+                        8,
+                        11
+                    ),
+                    (
+                        String::from("credit"),
+                        String::from("available"),
+                        Some(String::from("once")),
+                        String::from("credit"),
+                        8,
+                        11
+                    ),
+                ]
+            );
+            let references: Vec<String> = rows
+                .iter()
+                .map(|row| ok(row.try_get("reference")))
+                .collect();
+            assert_eq!(references, ["c-once", "c-once"]);
+        });
+    }
+
+    #[test]
+    fn entries_table_enforces_the_ledger_shape() {
+        let runtime = runtime();
+        block(&runtime, async {
+            let wallet = wallet(0).await;
+            for sql in [
+                "INSERT INTO entries (reference, reference_kind, account_kind, account_id, entry_key, direction, currency, amount, at) VALUES ('c', 'credit', 'funding', 'a', NULL, 'debit', 'usd', 1, 0)",
+                "INSERT INTO entries (reference, reference_kind, account_kind, account_id, entry_key, direction, currency, amount, at) VALUES ('c', 'credit', 'funding', NULL, NULL, 'credit', 'usd', 1, 0)",
+                "INSERT INTO entries (reference, reference_kind, account_kind, account_id, entry_key, direction, currency, amount, at) VALUES ('c', 'request', 'funding', NULL, NULL, 'debit', 'usd', 1, 0)",
+                "INSERT INTO entries (reference, reference_kind, account_kind, account_id, entry_key, direction, currency, amount, at) VALUES ('c', 'credit', 'available', 'a', 'k', 'credit', 'usd', 1, 0)",
+                "INSERT INTO entries (reference, reference_kind, account_kind, account_id, entry_key, direction, currency, amount, at) VALUES ('c', 'credit', 'available', 'a', NULL, 'debit', 'usd', 1, 0)",
+                "INSERT INTO entries (reference, reference_kind, account_kind, account_id, entry_key, direction, currency, amount, at) VALUES ('c', 'credit', 'held', 'a', NULL, 'credit', 'usd', 1, 0)",
+                "INSERT INTO entries (reference, reference_kind, account_kind, account_id, entry_key, direction, currency, amount, at) VALUES ('c', 'credit', 'revenue', NULL, NULL, 'credit', 'usd', 1, 0)",
+                "INSERT INTO entries (reference, reference_kind, account_kind, account_id, entry_key, direction, currency, amount, at) VALUES ('c', 'other', 'available', 'a', NULL, 'credit', 'usd', 1, 0)",
+                "INSERT INTO entries (reference, reference_kind, account_kind, account_id, entry_key, direction, currency, amount, at) VALUES ('c', 'credit', 'bogus', NULL, NULL, 'credit', 'usd', 1, 0)",
+                "INSERT INTO entries (reference, reference_kind, account_kind, account_id, entry_key, direction, currency, amount, at) VALUES ('c', 'request', 'available', NULL, NULL, 'credit', 'usd', 1, 0)",
+            ] {
+                assert!(execute(&wallet.pool, sql).await.is_err(), "{sql}");
+            }
+            ok(execute(
+                &wallet.pool,
+                "INSERT INTO entries (reference, reference_kind, account_kind, account_id, entry_key, direction, currency, amount, at) VALUES ('c', 'credit', 'funding', NULL, NULL, 'debit', 'usd', 1, 0), ('c', 'credit', 'available', 'a', NULL, 'credit', 'usd', 1, 0), ('c', 'credit', 'available', 'b', NULL, 'credit', 'usd', 1, 0), ('c', 'request', 'available', 'a', 'k', 'debit', 'usd', 1, 0)",
+            )
+            .await);
+            assert!(execute(
+                &wallet.pool,
+                "INSERT INTO entries (reference, reference_kind, account_kind, account_id, entry_key, direction, currency, amount, at) VALUES ('c', 'credit', 'available', 'a', NULL, 'credit', 'usd', 1, 0)",
+            )
+            .await
+            .is_err());
+        });
+    }
+
+    #[test]
+    fn migration_backfills_funding_entries_for_existing_credits() {
+        let runtime = runtime();
+        block(&runtime, async {
+            let pool = schema_pool(&database_url()).await;
+            let old: Vec<_> = migrations().into_iter().take(4).collect();
+            ok(run_migrations(&pool, old).await);
+            ok(execute(
+                &pool,
+                "INSERT INTO balances (account, currency, available, held, deposited) VALUES ('a', 'usd', 15, 0, 15), ('b', 'usd', 7, 0, 7)",
+            )
+            .await);
+            ok(execute(
+                &pool,
+                "INSERT INTO credits (account, credit_id, currency, amount, at) VALUES ('b', 'c-1', 'usd', 7, 20), ('a', 'c-1', 'usd', 10, 20), ('a', 'c-0', 'usd', 5, 10)",
+            )
+            .await);
+            ok(execute(
+                &pool,
+                "INSERT INTO entries (request, account_kind, account_id, entry_key, direction, currency, amount, at) VALUES ('r', 'held', 'a', 'k', 'credit', 'usd', 1, 5)",
+            )
+            .await);
+            ok(run_migrations(&pool, migrations()).await);
+            let rows = ok(sqlx::query(
+                "SELECT reference, reference_kind, account_kind, account_id, direction, amount, at FROM entries ORDER BY id",
+            )
+            .fetch_all(&pool)
+            .await);
+            let seen: Vec<BackfilledEntry> = rows
+                .iter()
+                .map(|row| {
+                    (
+                        ok(row.try_get("reference")),
+                        ok(row.try_get("reference_kind")),
+                        ok(row.try_get("account_kind")),
+                        ok(row.try_get("account_id")),
+                        ok(row.try_get("direction")),
+                        ok(row.try_get("amount")),
+                        ok(row.try_get("at")),
+                    )
+                })
+                .collect();
+            let row = |reference: &str,
+                       kind: &str,
+                       account: &str,
+                       id: Option<&str>,
+                       direction: &str,
+                       amount,
+                       at| {
+                (
+                    String::from(reference),
+                    String::from(kind),
+                    String::from(account),
+                    id.map(String::from),
+                    String::from(direction),
+                    amount,
+                    at,
+                )
+            };
+            assert_eq!(
+                seen,
+                [
+                    row("r", "request", "held", Some("a"), "credit", 1, 5),
+                    row("c-0", "credit", "funding", None, "debit", 5, 10),
+                    row("c-0", "credit", "available", Some("a"), "credit", 5, 10),
+                    row("c-1", "credit", "funding", None, "debit", 10, 20),
+                    row("c-1", "credit", "available", Some("a"), "credit", 10, 20),
+                    row("c-1", "credit", "funding", None, "debit", 7, 20),
+                    row("c-1", "credit", "available", Some("b"), "credit", 7, 20),
+                ]
+            );
+        });
+    }
+
+    async fn count_rows(pool: &sqlx::PgPool, table: &'static str) -> i64 {
+        ok(
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(pool)
+                .await,
+        )
     }
 
     #[test]

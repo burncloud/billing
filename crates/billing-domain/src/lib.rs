@@ -7,10 +7,13 @@ mod price_book;
 mod pricing;
 
 pub use funding::{
-    check_funding_currency, post_credit, CreditId, CreditPosting, Credited, FundingError,
-    FundingRejection, FundingRow, Opened, PendingHold,
+    check_funding_currency, credit_entries, post_credit, CreditApplied, CreditPosting,
+    CreditRequest, Credited, FundingError, FundingRejection, FundingRow, Opened, PendingHold,
 };
-pub use invariant::{check_ledger, request_held_flat, CurrencyFunds, InvariantViolation};
+pub use invariant::{
+    check_ledger, deposits_in, request_held_flat, AccountFunds, CurrencyFunds, InvariantViolation,
+};
+pub use kernel::model::CreditId;
 pub use posting::{
     post_hold, post_release, post_settle, ExistingHold, HoldRequest, OpenHold, Posted,
     ReleaseRequest, SettleRequest, SpendSoFar, StorageFault, WalletSnapshot,

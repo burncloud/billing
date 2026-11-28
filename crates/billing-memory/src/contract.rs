@@ -4,14 +4,17 @@ use std::task::{Context, Poll, Waker};
 use std::thread;
 
 use billing::errors::{BillingRejection, WalletError};
-use billing::model::{Entry, KeyCap};
+use billing::model::{Direction, Entry, EntryRef, KeyCap, LedgerAccount};
 use billing::ports::Wallet;
-use billing_domain::{check_ledger, request_held_flat, CurrencyFunds, StorageFault};
+use billing_domain::{
+    check_ledger, deposits_in, request_held_flat, AccountFunds, CurrencyFunds, StorageFault,
+};
 use kernel::model::{AccountId, Currency, KeyId, Money, RequestId, UnixMillis};
 
 /// 内存和以后的 Postgres 共用的钱包端口，外加测试钩子。
 pub trait WalletContract: Wallet<Error = StorageFault> + Sync {
     /// 已有该币种的行时，把金额加进可用余额和存入额。没有行时新建，冻结额为 0。
+    /// 同时写入入账分录：借 `Funding`、贷 `Available(account)`，单号由钱包自己生成。
     ///
     /// # Errors
     ///
@@ -58,6 +61,9 @@ pub trait WalletContract: Wallet<Error = StorageFault> + Sync {
     ///
     /// 合计溢出时返回 `WalletError::Rejected(BillingRejection::Overflow)`。
     fn funds(&self, currency: Currency) -> Result<CurrencyFunds, WalletError<StorageFault>>;
+
+    /// 钱包表里每个账户每个币种的一行，按账户、币种排序。
+    fn account_funds(&self) -> Vec<AccountFunds>;
 
     /// 之后写入的分录使用这个时刻。
     fn set_now(&self, now: UnixMillis);
@@ -106,6 +112,8 @@ where
     concurrent_accounts_share_one_key_cap(&new_store(), drive);
     accounts_open_and_credits_apply_once(&new_store(), drive);
     only_usd_accounts_are_opened_and_funded(&new_store(), drive);
+    credits_write_one_ledger_pair_once(&new_store(), drive);
+    deposits_and_credits_share_the_ledger(&new_store(), drive);
     open_holds_carry_their_creation_time(&new_store(), drive);
 }
 
@@ -151,7 +159,9 @@ fn hold_settle_and_release_keep_the_books<S: WalletContract, D: DriveWallet>(sto
     assert!(request_held_flat(&store.entries(), &account, &released).is_ok());
     let funds = must(store.funds(Currency::Usd));
     assert_eq!(funds.revenue, 25);
-    assert_eq!(funds.available + funds.held, funds.deposits - funds.revenue);
+    let deposits = must(deposits_in(&store.entries(), Currency::Usd));
+    assert_eq!(deposits, 100);
+    assert_eq!(funds.available + funds.held, deposits - funds.revenue);
     assert_books(store);
 }
 
@@ -510,7 +520,7 @@ fn accounts_open_and_credits_apply_once<S: WalletContract, D: DriveWallet>(store
     assert_eq!(store.credit(&other, &first, usd(7)), Ok(Credited::Applied));
     assert_eq!(available(store, drive, &other), 7);
     let funds = must(store.funds(Currency::Usd));
-    assert_eq!(funds.deposits, 112);
+    assert_eq!(must(deposits_in(&store.entries(), Currency::Usd)), 112);
     assert_eq!(funds.available + funds.held, 112);
     assert_books(store);
 }
@@ -549,7 +559,123 @@ fn only_usd_accounts_are_opened_and_funded<S: WalletContract, D: DriveWallet>(
         Err(FundingError::Rejected(unsupported))
     );
     assert_eq!(available(store, drive, &account), 100);
-    assert_eq!(must(store.funds(Currency::Cny)).deposits, 0);
+    assert_eq!(must(deposits_in(&store.entries(), Currency::Cny)), 0);
+    assert_books(store);
+}
+
+fn credit_pair(
+    account: &AccountId,
+    id: &billing_domain::CreditId,
+    minor: u64,
+    at: u64,
+) -> [Entry; 2] {
+    let reference = EntryRef::Credit(id.clone());
+    [
+        Entry {
+            reference: reference.clone(),
+            account: LedgerAccount::Funding,
+            key: None,
+            direction: Direction::Debit,
+            amount: usd(minor),
+            at: UnixMillis(at),
+        },
+        Entry {
+            reference,
+            account: LedgerAccount::Available(account.clone()),
+            key: None,
+            direction: Direction::Credit,
+            amount: usd(minor),
+            at: UnixMillis(at),
+        },
+    ]
+}
+
+fn credits_write_one_ledger_pair_once<S: WalletContract, D: DriveWallet>(store: &S, drive: &D) {
+    use billing_domain::{CreditId, Credited, FundingError, FundingRejection};
+
+    let account = AccountId(String::from("ledger"));
+    let other = AccountId(String::from("ledger-other"));
+    let first = CreditId(String::from("ledger-1"));
+    must(store.open_account(&account, Currency::Usd));
+    must(store.open_account(&other, Currency::Usd));
+    assert_eq!(store.entries().len(), 0);
+    assert!(store.credit(&account, &first, usd(0)).is_err());
+    assert_eq!(store.entries().len(), 0);
+    store.set_now(UnixMillis(500));
+    assert_eq!(
+        store.credit(&account, &first, usd(100)),
+        Ok(Credited::Applied)
+    );
+    let mut expected: Vec<Entry> = credit_pair(&account, &first, 100, 500).to_vec();
+    assert_eq!(store.entries(), expected);
+    assert_books(store);
+
+    store.set_now(UnixMillis(600));
+    assert_eq!(
+        store.credit(&account, &first, usd(100)),
+        Ok(Credited::AlreadyApplied)
+    );
+    assert_eq!(store.entries(), expected);
+    assert_eq!(
+        store.credit(&account, &first, usd(7)),
+        Err(FundingError::Rejected(FundingRejection::ConflictingCredit))
+    );
+    assert_eq!(
+        store.credit(&account, &first, cny(100)),
+        Err(FundingError::Rejected(
+            FundingRejection::UnsupportedCurrency
+        ))
+    );
+    assert_eq!(
+        store.credit(&account, &CreditId(String::new()), usd(1)),
+        Err(FundingError::Rejected(FundingRejection::EmptyCreditId))
+    );
+    assert_eq!(
+        store.credit(
+            &account,
+            &CreditId(String::from("ledger-big")),
+            usd(u64::MAX)
+        ),
+        Err(FundingError::Rejected(FundingRejection::Overflow))
+    );
+    assert_eq!(store.entries(), expected);
+    assert_books(store);
+
+    assert_eq!(store.credit(&other, &first, usd(30)), Ok(Credited::Applied));
+    expected.extend(credit_pair(&other, &first, 30, 600));
+    assert_eq!(store.entries(), expected);
+    assert_eq!(must(deposits_in(&store.entries(), Currency::Usd)), 130);
+    assert_books(store);
+
+    let request = RequestId(String::from("ledger-req"));
+    let key = KeyId(String::from("ledger-key"));
+    must(drive.run(Wallet::hold(store, &account, &request, &key, None, usd(40))));
+    must(drive.run(Wallet::settle(store, &account, &request, usd(25))));
+    assert_eq!(available(store, drive, &account), 75);
+    assert_eq!(available(store, drive, &other), 30);
+    assert_eq!(
+        store.credit(&account, &first, usd(100)),
+        Ok(Credited::AlreadyApplied)
+    );
+    assert_eq!(store.entries().len(), expected.len() + 6);
+    assert_books(store);
+}
+
+fn deposits_and_credits_share_the_ledger<S: WalletContract, D: DriveWallet>(store: &S, drive: &D) {
+    use billing_domain::{CreditId, Credited};
+
+    let account = AccountId(String::from("shared"));
+    must(store.deposit(&account, usd(10)));
+    must(store.deposit(&account, cny(4)));
+    assert_eq!(
+        store.credit(&account, &CreditId(String::from("shared-1")), usd(5)),
+        Ok(Credited::Applied)
+    );
+    let entries = store.entries();
+    assert_eq!(entries.len(), 6);
+    assert_eq!(must(deposits_in(&entries, Currency::Usd)), 15);
+    assert_eq!(must(deposits_in(&entries, Currency::Cny)), 4);
+    assert_eq!(available(store, drive, &account), 15);
     assert_books(store);
 }
 
@@ -629,7 +755,7 @@ fn assert_books(store: &impl WalletContract) {
     let mut funds = Vec::new();
     for currency in [Currency::Usd, Currency::Cny] {
         let row = must(store.funds(currency));
-        let used = row.available > 0 || row.held > 0 || row.deposits > 0 || row.revenue > 0;
+        let used = row.available > 0 || row.held > 0 || row.revenue > 0;
         let mentioned = entries
             .iter()
             .any(|entry| entry.amount.currency == currency);
@@ -637,7 +763,7 @@ fn assert_books(store: &impl WalletContract) {
             funds.push(row);
         }
     }
-    assert!(check_ledger(&entries, &funds).is_ok());
+    assert!(check_ledger(&entries, &funds, &store.account_funds()).is_ok());
 }
 
 fn available<S: WalletContract, D: DriveWallet>(store: &S, drive: &D, account: &AccountId) -> u64 {

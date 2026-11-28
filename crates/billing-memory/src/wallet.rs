@@ -7,10 +7,10 @@ use billing::errors::{BillingRejection, WalletError};
 use billing::model::{Direction, Entry, KeyCap, LedgerAccount};
 use billing::ports::Wallet;
 use billing_domain::{
-    check_funding_currency, post_credit, post_hold, post_release, post_settle, CreditId,
-    CreditPosting, Credited, CurrencyFunds, ExistingHold, FundingError, FundingRow, HoldRequest,
-    OpenHold, Opened, PendingHold, ReleaseRequest, SettleRequest, SpendSoFar, StorageFault,
-    WalletSnapshot,
+    check_funding_currency, credit_entries, post_credit, post_hold, post_release, post_settle,
+    AccountFunds, CreditId, CreditPosting, CreditRequest, Credited, CurrencyFunds, ExistingHold,
+    FundingError, FundingRow, HoldRequest, OpenHold, Opened, PendingHold, ReleaseRequest,
+    SettleRequest, SpendSoFar, StorageFault, WalletSnapshot,
 };
 use kernel::model::{AccountId, Currency, KeyId, Money, RequestId, UnixMillis};
 use kernel::ports::Clock;
@@ -115,6 +115,11 @@ impl WalletContract for MemoryWallet<ManualClock> {
             .checked_add(amount.minor_units)
             .ok_or(WalletError::Rejected(BillingRejection::Overflow))?;
         state.deposits.insert(key.clone(), deposited);
+        let seed = CreditId(format!("seed-{}", state.entries.len()));
+        let at = self.clock.now();
+        state
+            .entries
+            .extend(credit_entries(account, &seed, amount, at));
         state.balances.insert(
             key,
             WalletSnapshot {
@@ -180,11 +185,19 @@ impl WalletContract for MemoryWallet<ManualClock> {
                 .unwrap_or_default(),
         });
         let existing = state.credits.get(&credit_key).copied();
-        let funded = match post_credit(credit, amount, row, existing) {
+        let applied = match post_credit(&CreditRequest {
+            account,
+            credit,
+            amount,
+            row,
+            existing,
+            at: self.clock.now(),
+        }) {
             Ok(CreditPosting::AlreadyApplied) => return Ok(Credited::AlreadyApplied),
-            Ok(CreditPosting::Apply(funded)) => funded,
+            Ok(CreditPosting::Apply(applied)) => applied,
             Err(reason) => return Err(FundingError::Rejected(reason)),
         };
+        let funded = applied.row;
         let held = state
             .balances
             .get(&balance_key)
@@ -204,6 +217,7 @@ impl WalletContract for MemoryWallet<ManualClock> {
         );
         state.deposits.insert(balance_key, funded.deposited);
         state.credits.insert(credit_key, amount);
+        state.entries.extend(applied.entries);
         Ok(Credited::Applied)
     }
 
@@ -245,7 +259,6 @@ impl WalletContract for MemoryWallet<ManualClock> {
         let state = self.lock();
         let mut available = 0_u64;
         let mut held = 0_u64;
-        let mut deposits = 0_u64;
         for ((_, row_currency), snapshot) in &state.balances {
             if *row_currency != currency {
                 continue;
@@ -257,22 +270,29 @@ impl WalletContract for MemoryWallet<ManualClock> {
                 .checked_add(snapshot.held.minor_units)
                 .ok_or(WalletError::Rejected(BillingRejection::Overflow))?;
         }
-        for ((_, row_currency), amount) in &state.deposits {
-            if *row_currency != currency {
-                continue;
-            }
-            deposits = deposits
-                .checked_add(*amount)
-                .ok_or(WalletError::Rejected(BillingRejection::Overflow))?;
-        }
         let revenue = revenue_of(&state.entries, currency)?;
         Ok(CurrencyFunds {
             currency,
             available,
             held,
-            deposits,
             revenue,
         })
+    }
+
+    fn account_funds(&self) -> Vec<AccountFunds> {
+        let state = self.lock();
+        let mut rows: Vec<AccountFunds> = state
+            .balances
+            .iter()
+            .map(|((account, currency), snapshot)| AccountFunds {
+                account: account.clone(),
+                currency: *currency,
+                available: snapshot.available.minor_units,
+                held: snapshot.held.minor_units,
+            })
+            .collect();
+        rows.sort_by_key(|row| (row.account.0.clone(), matches!(row.currency, Currency::Cny)));
+        rows
     }
 }
 
