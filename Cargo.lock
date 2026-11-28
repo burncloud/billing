@@ -31,8 +31,8 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "billing"
-version = "0.3.0"
-source = "git+https://github.com/burncloud/next?rev=881b3db82b8e4eb5dbbb3abcf6e8ab8562dc94c9#881b3db82b8e4eb5dbbb3abcf6e8ab8562dc94c9"
+version = "0.4.0"
+source = "git+https://github.com/burncloud/next?rev=65462728d20dd2640afff380cdff2cd8990e0535#65462728d20dd2640afff380cdff2cd8990e0535"
 dependencies = [
  "kernel",
 ]
@@ -560,8 +560,8 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.3.0"
-source = "git+https://github.com/burncloud/next?rev=881b3db82b8e4eb5dbbb3abcf6e8ab8562dc94c9#881b3db82b8e4eb5dbbb3abcf6e8ab8562dc94c9"
+version = "0.4.0"
+source = "git+https://github.com/burncloud/next?rev=65462728d20dd2640afff380cdff2cd8990e0535#65462728d20dd2640afff380cdff2cd8990e0535"
 
 [[package]]
 name = "libc"
