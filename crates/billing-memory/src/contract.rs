@@ -7,8 +7,9 @@ use billing::errors::{BillingRejection, WalletError};
 use billing::model::{Direction, Entry, EntryRef, KeyCap, LedgerAccount};
 use billing::ports::Wallet;
 use billing_domain::{
-    check_ledger, deposits_in, request_held_flat, AccountFunds, CurrencyFunds, StorageFault,
+    check_ledger, request_held_flat, CurrencyFunds, InvariantViolation, StorageFault,
 };
+use billing_domain::{deposits_in, AccountFunds};
 use kernel::model::{AccountId, Currency, KeyId, Money, RequestId, UnixMillis};
 
 /// 内存和以后的 Postgres 共用的钱包端口，外加测试钩子。
