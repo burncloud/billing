@@ -281,4 +281,48 @@ mod tests {
         );
         assert_eq!(applied.entries.len(), 2);
     }
+
+    #[test]
+    fn credit_rejections_keep_this_order() {
+        let cny = Money {
+            currency: Currency::Cny,
+            minor_units: 0,
+        };
+        let cny_paid = Money {
+            currency: Currency::Cny,
+            minor_units: 3,
+        };
+        assert_eq!(
+            post(&id(""), cny, None, Some(usd(1))),
+            Err(FundingRejection::EmptyCreditId)
+        );
+        assert_eq!(
+            post(&id(""), usd(0), None, Some(usd(1))),
+            Err(FundingRejection::EmptyCreditId)
+        );
+        assert_eq!(
+            post(&id("c"), cny, None, Some(cny_paid)),
+            Err(FundingRejection::ZeroAmount)
+        );
+        assert_eq!(
+            post(&id("c"), usd(0), None, None),
+            Err(FundingRejection::ZeroAmount)
+        );
+        assert_eq!(
+            post(&id("c"), cny_paid, None, Some(usd(3))),
+            Err(FundingRejection::UnsupportedCurrency)
+        );
+        assert_eq!(
+            post(&id("c"), usd(4), None, Some(usd(4))),
+            Ok(CreditPosting::AlreadyApplied)
+        );
+        assert_eq!(
+            post(&id("c"), usd(5), None, Some(usd(4))),
+            Err(FundingRejection::ConflictingCredit)
+        );
+        assert_eq!(
+            post(&id("c"), usd(1), None, None),
+            Err(FundingRejection::NotOpened)
+        );
+    }
 }
